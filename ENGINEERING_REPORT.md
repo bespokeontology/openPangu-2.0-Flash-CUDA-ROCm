@@ -46,8 +46,17 @@ each run. Context limit 4096.
 |---|---|---|---|---|
 | 96 | 127 | not measured | 43.3593 | 62/99 |
 | 300 | 331 | 21.0090 | 43.3694 | 197/300 |
+| 300 | 331 | not measured | 44.6561 | 197/300 |
 | 200 | 4,008 | 15.2955 | 20.0518 | 132/195 |
 | 64 | 11,139 | 14.1020 | not measured | n/a |
+
+The two 331-context MTP rows differ only in GPU clock state: the first was taken with
+the machine as found, the second after nvidia-smi -lgc 3003,3003. The lock is worth
+about 3 per cent and does not change acceptance. Note that on GB10 nvidia-smi continued
+to report clocks.applications.graphics = 2418 MHz after the lock was accepted, so that
+field is not a reliable indication of the applied state. All other measurements in this
+report were taken without the lock and are therefore conservative by roughly that
+margin.
 
 Decode throughput falls with context. Trunk goes from 47.6 ms/token at 331 context to
 65.4 ms/token at 4,008. The MTP speedup falls with it, from 2.06x at 331 context to
@@ -115,6 +124,7 @@ decode figures above, and reverted. The shipped configuration contains none of t
 | the above plus fused multi-row attention launch | 78.4813 s | 14.5803 tok/s | rejected |
 | device-grouped expert path in prefill | 60.4768 s | 15.3282 tok/s | rejected, see below |
 | indexer query staged in shared memory | not measured | 42.5606 tok/s at 331 ctx | rejected |
+| GPU clock lock at 3003 MHz | not measured | 44.6561 tok/s at 331 ctx | retained, operational |
 
 Notes on each.
 
