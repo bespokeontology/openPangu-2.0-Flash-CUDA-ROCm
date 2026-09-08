@@ -1,5 +1,8 @@
 This repository contains an independent C++/CUDA inference engine for the
-openPangu-2.0-Flash model. It contains no model weights.
+openPangu-2.0-Flash model. It contains no model weights and vendors no
+third-party source.
+
+MODEL
 
 The model, its weights, its tokenizer and its configuration are separate works
 owned by Huawei / Ascend Tribe and are governed by the OpenPangu Model License
@@ -11,4 +14,19 @@ accept its licence separately:
 Huawei, Ascend, Ascend Tribe and openPangu are the marks of their respective
 owners. This project is not affiliated with or endorsed by Huawei.
 
-The engine source in this repository is MIT licensed; see LICENSE.
+BUILD DEPENDENCIES
+
+The engine includes headers from the following projects at build time. None of
+their source is redistributed here; supply them at configure time.
+
+  NVIDIA CUTLASS / CuTe          BSD-3-Clause
+  FlashInfer                     Apache-2.0
+  NVIDIA CUDA Toolkit, incl. CUB NVIDIA Software Licence Agreement
+  PCRE2                          BSD-3-Clause (linked)
+
+Their licence terms apply to those components and are not superseded by the
+LICENSE file in this repository.
+
+ENGINE SOURCE
+
+MIT licensed; see LICENSE.
