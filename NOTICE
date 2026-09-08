@@ -1,0 +1,14 @@
+This repository contains an independent C++/CUDA inference engine for the
+openPangu-2.0-Flash model. It contains no model weights.
+
+The model, its weights, its tokenizer and its configuration are separate works
+owned by Huawei / Ascend Tribe and are governed by the OpenPangu Model License
+Agreement distributed with the official checkpoint. Obtain the checkpoint and
+accept its licence separately:
+
+  https://huggingface.co/openpangu/openPangu-2.0-Flash
+
+Huawei, Ascend, Ascend Tribe and openPangu are the marks of their respective
+owners. This project is not affiliated with or endorsed by Huawei.
+
+The engine source in this repository is MIT licensed; see LICENSE.
