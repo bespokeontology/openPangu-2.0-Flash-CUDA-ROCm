@@ -73,7 +73,24 @@ produces less predictable continuations and a lower ratio:
 Any published MTP figure must state its prompt. The spread between these two prompts is
 about 20 per cent at identical context and identical binary.
 
-### 3.3 Context sensitivity
+### 3.3 Generation length
+
+MTP acceptance decays as a generation extends, because continuations drift away from what
+the three draft stages predict well. Context growth adds the DSA cost described in 3.4.
+All rows below use the MTP binary.
+
+| prompt | requested | emitted | tok/s | acceptance | end context |
+|---|---|---|---|---|---|
+| Explain probability in one clear sentence. | 96 | 96 | 46.28 / 52.10 | 67/81 = 82.7% | 123 |
+| Explain probability in one clear sentence. | 300 | 300 | 47.5586 | 204/282 = 72.3% | 327 |
+| Explain probability in one clear sentence. | 800 | 458, EOS | 45.3546 | 308/453 = 68.0% | 485 |
+| Detailed bicycle explanation | 800 | 800 | 33.8432 | 507/873 = 58.1% | 845 |
+
+Short answers sustain the mid 40s to low 50s. A long substantive answer measures 33.84
+tok/s. A single published figure is not meaningful without stating both the prompt and
+the generation length.
+
+### 3.4 Context sensitivity
 
 Prompt: "Summarise Kolmogorov complexity in two sentences." unless noted.
 
@@ -96,7 +113,7 @@ layer, well above the streaming floor for the bytes involved. Below 2,048 contex
 code takes a dense path and no selection runs (src/model.cpp, the positions <= kDsaTopK
 branch).
 
-### 3.4 Binary and machine-state controls
+### 3.5 Binary and machine-state controls
 
 | variation | tok/s | acceptance |
 |---|---|---|

@@ -79,6 +79,7 @@ DGX Spark GB10, NVFP4 resident, 56.9 GB. Full conditions and method in
 |---|---|
 | decode, MTP, documented gate | 52.10 tok/s, acceptance 67/81 |
 | decode, MTP, harder prompt | 43.37 tok/s, acceptance 197/300 |
+| decode, MTP, 800-token answer | 33.84 tok/s, acceptance 507/873 |
 | decode, 331 context, trunk | 21.01 tok/s |
 | decode, 4,008 context, MTP | 20.05 tok/s |
 | decode, 11,139 context, trunk | 14.10 tok/s |
