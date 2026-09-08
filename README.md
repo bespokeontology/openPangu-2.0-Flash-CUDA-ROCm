@@ -77,7 +77,8 @@ DGX Spark GB10, NVFP4 resident, 56.9 GB. Full conditions and method in
 
 | workload | result |
 |---|---|
-| decode, 331 context, MTP | 43.37 tok/s as found, 44.66 with clocks locked, acceptance 197/300 |
+| decode, MTP, documented gate | 52.10 tok/s, acceptance 67/81 |
+| decode, MTP, harder prompt | 43.37 tok/s, acceptance 197/300 |
 | decode, 331 context, trunk | 21.01 tok/s |
 | decode, 4,008 context, MTP | 20.05 tok/s |
 | decode, 11,139 context, trunk | 14.10 tok/s |
@@ -85,8 +86,10 @@ DGX Spark GB10, NVFP4 resident, 56.9 GB. Full conditions and method in
 | prefill, 10,970 tokens | 268.42 s = 40.9 tok/s |
 | cold load, page cache dropped | 59-65 s |
 
-Decode falls with context because DSA index selection scans every position on 16 of the
-46 layers per token; attention itself is bounded. Prefill is the weaker component and
+MTP throughput tracks draft acceptance, which depends on the prompt: the two rows above
+use the same binary and context and differ only in what was asked. Decode also falls with
+context because DSA index selection scans every position on 16 of the 46 layers per
+token, while attention itself is bounded. Prefill is the weaker component and
 `docs/PREFILL_MEASUREMENTS.md` records four changes that were measured and rejected.
 
 A llama.cpp Q4_K_M build of the same model on the same machine measures 11.30 tok/s

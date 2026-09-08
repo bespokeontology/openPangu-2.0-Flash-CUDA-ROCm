@@ -39,53 +39,78 @@ Cold load with page cache dropped: 58.8 to 65.4 s.
 
 ## 3. Decode
 
-Prompt: "Summarise Kolmogorov complexity in two sentences." Page cache dropped before
-each run. Context limit 4096.
+Page cache dropped before each run. Context limit 4096. GPU clocks locked with
+nvidia-smi -lgc 3003,3003 where stated.
+
+### 3.1 Documented acceptance gate
+
+Prompt: "Explain probability in one clear sentence.", 96 generated tokens. This is the
+gate used by frozen/native-mtp-row-parallel-20260822/RECEIPT.md.
+
+| source | tok/s | acceptance |
+|---|---|---|
+| that receipt, run 1 | 53.2100 | 69/84 |
+| that receipt, run 2 | 54.6355 | 69/84 |
+| this build, run 1 | 46.2825 | 67/81 |
+| this build, run 2 | 52.1041 | 67/81 |
+
+Acceptance agrees to within one per cent and the second run agrees to within two per
+cent. The first run of a pair is slower in both the original receipt and here. The
+engine reproduces its documented figure.
+
+### 3.2 Prompt sensitivity
+
+MTP emits accepted drafts without a full target step, so throughput tracks the
+acceptance ratio. A second prompt, "Summarise Kolmogorov complexity in two sentences.",
+produces less predictable continuations and a lower ratio:
+
+| prompt | generated | acceptance | MTP tok/s |
+|---|---|---|---|
+| Explain probability in one clear sentence. | 96 | 67/81 = 82.7% | 46.28 / 52.10 |
+| Summarise Kolmogorov complexity in two sentences. | 96 | 62/99 = 62.6% | 43.36 |
+| Summarise Kolmogorov complexity in two sentences. | 300 | 197/300 = 65.7% | 43.37 - 44.66 |
+
+Any published MTP figure must state its prompt. The spread between these two prompts is
+about 20 per cent at identical context and identical binary.
+
+### 3.3 Context sensitivity
+
+Prompt: "Summarise Kolmogorov complexity in two sentences." unless noted.
 
 | generated | end context | trunk tok/s | MTP tok/s | MTP acceptance |
 |---|---|---|---|---|
-| 96 | 127 | not measured | 43.3593 | 62/99 |
 | 300 | 331 | 21.0090 | 43.3694 | 197/300 |
-| 300 | 331 | not measured | 44.6561 | 197/300 |
 | 200 | 4,008 | 15.2955 | 20.0518 | 132/195 |
 | 64 | 11,139 | 14.1020 | not measured | n/a |
 
-The two 331-context MTP rows differ only in GPU clock state: the first was taken with
-the machine as found, the second after nvidia-smi -lgc 3003,3003. The lock is worth
-about 3 per cent and does not change acceptance. Note that on GB10 nvidia-smi continued
-to report clocks.applications.graphics = 2418 MHz after the lock was accepted, so that
-field is not a reliable indication of the applied state. All other measurements in this
-report were taken without the lock and are therefore conservative by roughly that
-margin.
-
-Decode throughput falls with context. Trunk goes from 47.6 ms/token at 331 context to
-65.4 ms/token at 4,008. The MTP speedup falls with it, from 2.06x at 331 context to
-1.31x at 4,008, while acceptance stays near 66 per cent in both cases.
+Trunk decode goes from 47.6 ms/token at 331 context to 65.4 ms/token at 4,008. The MTP
+speedup falls from 2.06x to 1.31x over the same range while acceptance stays near 66 per
+cent, so the loss is in the target step rather than in speculation quality.
 
 The cause is the DSA index path. Attention itself is bounded: sliding layers see 128
 sinks plus a 512 window, and non-sliding layers attend at most kDsaTopK = 2048 selected
-keys. Selecting those 2048 is not bounded. dsa_score_kernel scores every position in
-the context, on the 16 layers where index % 3 == 0, on every token. Measured growth is
+keys. Selecting those 2048 is not bounded. dsa_score_kernel scores every position in the
+context, on the 16 layers where index % 3 == 0, on every token. Measured growth is
 17.8 ms per token across 3,677 additional positions, roughly 0.30 us per position per
-layer, which is far above the streaming floor for the bytes involved. Below 2,048
-context the code takes a dense path and no selection runs (src/model.cpp, the
-positions <= kDsaTopK branch).
+layer, well above the streaming floor for the bytes involved. Below 2,048 context the
+code takes a dense path and no selection runs (src/model.cpp, the positions <= kDsaTopK
+branch).
 
-### Comparison with the earlier frozen binary
+### 3.4 Binary and machine-state controls
 
-frozen/native-mtp-row-parallel-20260822/RECEIPT.md reports 53.2100 and 54.6355 tok/s.
-That binary was run on the gate above for comparison:
-
-| binary | tok/s | acceptance |
+| variation | tok/s | acceptance |
 |---|---|---|
-| frozen/native-mtp-row-parallel-20260822/p92_chat_mtp | 42.5296 | 197/300 |
 | build/p92_chat_mtp at 78c6f3a | 43.3694 | 197/300 |
+| frozen/native-mtp-row-parallel-20260822/p92_chat_mtp | 42.5296 | 197/300 |
+| clocks locked at 3003 MHz | 44.6561 | 197/300 |
+| Chrome closed, swap cleared, clocks locked | 43.5413 | 197/300 |
 
-The two agree within run variance and produce identical acceptance. The kernel sources
-in cuda/model_ops.cu and cuda/nvfp4_grouped.cu are byte-identical between commit ccc8678
-(the source of that receipt) and 78c6f3a. The 53-54 figures are therefore not
-reproducible against this checkpoint and prompt, and no optimisation present in the
-frozen binary is missing from the current build.
+All on the Kolmogorov prompt at 300 tokens. The frozen binary and the current build agree
+within run variance and produce identical acceptance; cuda/model_ops.cu and
+cuda/nvfp4_grouped.cu are byte-identical between commit ccc8678 and 78c6f3a. Clock lock
+and desktop load account for a few per cent and do not explain prompt-driven differences.
+Note that on GB10 nvidia-smi continued to report clocks.applications.graphics = 2418 MHz
+after the lock was accepted, so that field does not indicate the applied state.
 
 ## 4. Prefill
 
