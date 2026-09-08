@@ -55,6 +55,10 @@ openPangu is a trademark of Huawei Technologies Co., Ltd.
 
 This repository is released under the OpenPangu Model License Agreement
 Version 2.0, reproduced in full in LICENSE, in accordance with section 4.1.
+The upstream notices are retained byte-for-byte in legal/:
+
+  legal/LICENSE.openPangu-model     the agreement as published by Huawei
+  legal/NOTICE.openPangu-bundled    Huawei's Open Source Software Notice
 
 Note section 3.1 of that agreement: the Model may not be accessed, downloaded,
 installed, run, deployed, integrated, modified or otherwise used within the
