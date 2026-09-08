@@ -1,3 +1,5 @@
+Copyright 2026 bespokeontology
+
 This repository contains an independent C++/CUDA inference engine for the
 openPangu-2.0-Flash model. It contains no model weights and vendors no
 third-party source.
