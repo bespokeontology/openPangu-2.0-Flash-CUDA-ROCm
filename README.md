@@ -98,4 +98,5 @@ decode and 243-274 tok/s prefill.
 
 ## Licence
 
-Engine source: MIT (`LICENSE`). Model weights and tokenizer: separate, see `NOTICE`.
+Engine source: Apache-2.0 (`LICENSE`), matching the licence Huawei applies to its own
+openPangu inference code. Model weights and tokenizer: separate terms, see `NOTICE`.
