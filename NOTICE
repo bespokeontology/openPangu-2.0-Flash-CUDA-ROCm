@@ -47,13 +47,15 @@ their source is redistributed here; supply them at configure time.
 Their licence terms apply to those components and are not superseded by the
 LICENSE file in this repository.
 
-ENGINE SOURCE
+LICENCE
 
-Licensed under the Apache License, Version 2.0; see LICENSE. You may not use
-these files except in compliance with that licence. Unless required by
-applicable law or agreed to in writing, software distributed under the Licence
-is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-KIND, either express or implied.
+Powered by openPangu.
 
-Apache-2.0 matches the licence Huawei applies to its own openPangu inference
-code.
+openPangu is a trademark of Huawei Technologies Co., Ltd.
+
+This repository is released under the OpenPangu Model License Agreement
+Version 2.0, reproduced in full in LICENSE, in accordance with section 4.1.
+
+Note section 3.1 of that agreement: the Model may not be accessed, downloaded,
+installed, run, deployed, integrated, modified or otherwise used within the
+European Union.

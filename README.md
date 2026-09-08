@@ -98,5 +98,9 @@ decode and 243-274 tok/s prefill.
 
 ## Licence
 
-Engine source: Apache-2.0 (`LICENSE`), matching the licence Huawei applies to its own
-openPangu inference code. Model weights and tokenizer: separate terms, see `NOTICE`.
+Powered by openPangu. openPangu is a trademark of Huawei Technologies Co., Ltd.
+
+Released under the OpenPangu Model License Agreement Version 2.0, reproduced in full in
+`LICENSE`. Note section 3.1: the Model may not be used within the European Union. The
+model weights and tokenizer are obtained separately from Huawei under the same
+agreement; see `NOTICE`.
