@@ -16,6 +16,24 @@ accept its licence separately:
 Huawei, Ascend, Ascend Tribe and openPangu are the marks of their respective
 owners. This project is not affiliated with or endorsed by Huawei.
 
+REFERENCE MATERIAL
+
+The runtime semantics implemented here — layer topology, MLA and compressed-KV
+handling, the DSA index path, MoME state, the mHC merge, routing and the MoE
+accumulation order — were determined by reading Huawei's published openPangu
+model card, checkpoint configuration, and the openPangu-2.0-Infer inference
+implementation, which is licensed under Apache-2.0. Specifically:
+
+  components/omni-npu/src/omni_npu/v1/models/pangu/pangu_v2_moe.py
+  components/omni-npu/src/omni_npu/v1/models/pangu/pangu_v2_moe_mtp.py
+  components/omni-npu/src/omni_npu/attention/backends/{mla,dsa,mome}.py
+  components/omni-cache/omni_cache/cache/prefill/mome_state_utils.py
+
+No source from those files is copied into this repository. The code here is an
+independent C++/CUDA implementation written against NVIDIA hardware, and its
+kernels, memory layout, quantisation handling and scheduling differ throughout.
+The reference is credited because the behaviour it defines is Huawei's work.
+
 BUILD DEPENDENCIES
 
 The engine includes headers from the following projects at build time. None of
