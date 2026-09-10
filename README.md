@@ -1,4 +1,4 @@
-# openPangu Flash92 — native inference engines (CUDA / gfx906)
+# openPangu Flash92 — C++/CUDA & C++/HIP ROCm Engines
 
 **English** | [中文](README.zh.md) | [Русский](README.ru.md)
 
@@ -135,3 +135,22 @@ Released under the OpenPangu Model License Agreement Version 2.0, reproduced in 
 model weights and tokenizer are obtained separately from Huawei under the same
 agreement; see `NOTICE`. `legal/` retains Huawei's licence and Open Source Software
 Notice as exact upstream bytes.
+
+## Credits
+
+Engine design, kernels, measurement and documentation were produced by AI coding
+agents working under operator direction, on the operator hardware:
+
+- **NVIDIA DGX Spark CUDA backend** (this repository, root): Claude (Anthropic)
+  agent sessions.
+- **AMD gfx906 backend** (`amd-gfx906/`): the DeepSeek V4 Flash harness agent -
+  G2TQ1 head-shared sparse attention (SPG2), the packed-selection consumer, the
+  MTP NVFP4 artifact and quantizer, the native three-head draft path and
+  speculative state machine, and this publication.
+- Ancillary kernel and profiling work on the shared gfx906 machine: Claude, Codex
+  and Grok agent sessions.
+
+All benchmark numbers in this repository come from receipts committed by those
+sessions; the frozen binaries and their SHA-256 hashes are recorded in
+`amd-gfx906/decode/receipts/18_FROZEN_DECODE_AUTHORITY.md` and
+`amd-gfx906/prefill/23_SPG2_SHIPS.md`.

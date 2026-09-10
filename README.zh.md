@@ -1,4 +1,4 @@
-# openPangu-2.0-Flash — 原生 AMD gfx906 后端
+# openPangu Flash92 — C++/CUDA 与 C++/HIP ROCm 推理引擎
 
 [English](README.md) | **中文** | [Русский](README.ru.md)
 

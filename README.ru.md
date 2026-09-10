@@ -1,4 +1,4 @@
-# openPangu-2.0-Flash — нативный бэкенд AMD gfx906
+# openPangu Flash92 — движки C++/CUDA и C++/HIP ROCm
 
 [English](README.md) | [中文](README.zh.md) | **Русский**
 
