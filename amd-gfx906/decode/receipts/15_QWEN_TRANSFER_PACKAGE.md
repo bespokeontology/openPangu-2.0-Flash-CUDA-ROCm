@@ -30,7 +30,13 @@ Bank the other backend's finding as a test case. Confirm or falsify it here.
 
 ## 1. Read these first
 
-All under `/srv/pangu/p92-amd/receipts/` on the AMD host:
+On the AMD host these live under `/data/openpangu/p92-amd/receipts/`, and they are
+published (so link them from your README instead of copying them):
+`amd-gfx906/decode/receipts/` in the openPangu AMD tree on GitHub and Gitee.
+The old `/srv/pangu/p92-amd/receipts/` path in the first version of this file no
+longer exists.
+
+The six that matter most:
 
     10_GFX906_PLAYBOOK.md    the hardware lessons. READ IN FULL. 7 sections.
     11_PROFILING_LAW.md      how measurement lies. Three named contaminations.
