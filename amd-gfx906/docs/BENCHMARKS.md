@@ -1,4 +1,4 @@
-# Benchmarks — DGX Spark (CUDA, MTP ON) and AMD gfx906 (plain, MTP OFF)
+# Benchmarks — DGX Spark (CUDA) and AMD gfx906 (HIP)
 
 Every number below is copied from a committed receipt. Where the two backends
 were not measured with the same methodology, the methodology column says so;
@@ -17,14 +17,13 @@ decode with MTP disabled (`p92_gen`).**
 | NVIDIA CUDA | DGX Spark GB10 | MTP / speculative | ON | 331 | "Summarise Kolmogorov complexity in two sentences." | 300 | 43.3694 | Spark `ENGINEERING_REPORT.md` §3.4 (acceptance 197/300) |
 | NVIDIA CUDA | DGX Spark GB10 | plain target | OFF | 331 | "Summarise Kolmogorov complexity in two sentences." | 300 | 21.0090 | Spark `ENGINEERING_REPORT.md` §3.4 |
 | NVIDIA CUDA | DGX Spark GB10 | plain target | OFF | 4,008 | same | 200 | 15.2955 | Spark `ENGINEERING_REPORT.md` §3.4 |
-| **AMD gfx906** | **4x MI50 / Pro VII** | **plain target** | **OFF** | **512** | **fixed token stream** | **12** | **69.92** | `decode/ENGINEERING_REPORT.md` (rung ladder; frozen binary `freeze-69.9/p92_gen`, sha256 b28f0eef...) |
+| **AMD gfx906** | **4x MI50 / Pro VII** | **plain target** | **OFF** | **512** | **fixed token stream** | **12** | **69.92** | `decode/receipts/18_FROZEN_DECODE_AUTHORITY.md` (ladder rung "69.92 mla_g16 branchless loads"; frozen binary sha256 b28f0eef71121a0199315dfc4b5d1deee1ebbe3b8dafaad4cd40657a24d52d75) |
 
-Note on the two decode regimes: the Spark rows are different prompts and
-generation lengths on a different machine; the AMD row is the frozen
-authority rung measured on the project's own fixed token stream at short
-context. The Spark MTP rows are not comparable to the AMD row as a
-backend-versus-backend comparison, because one uses speculative decoding and
-the other does not.
+The Spark MTP rows and the AMD plain-target row are different decode modes and
+are not presented as an apples-to-apples backend comparison. The table also
+includes the available Spark plain-target measurements, but those use different
+prompts, context lengths and generation lengths from the AMD frozen-authority
+measurement; no derived cross-backend ratio is reported.
 
 ## 2. Prefill
 
