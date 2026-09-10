@@ -79,8 +79,9 @@ Run under the machine lock: `~/q27bench ./p92_pf_bench <checkpoint> <artifact> <
 
 ## Context
 
-- **Supported prompt context: 62,144 tokens** (the decode engine sizes its DSA caches from the `MAXPOS` argument; 62,144/pass it as the 5th argument).
-- Prefill is verified to 65,536 tokens at 698.2 tok/s (TTFT 0.65 s); 128K and 256K exceed VRAM on the 4x16 GB configuration.
+- **Measured prompt context: 70,008 tokens** (20.29 ms/token = 49.28 tok/s over the run; 20.87 ms at position 70,007). The decode engine sizes its DSA caches from the `MAXPOS` argument and crosses 2^16 = 65,536 with no change in behaviour, so 16-bit position and slot indices are not a limit. `MAXPOS=262144` allocates ~369 MB per DSA layer (~1.5 GB a card) and runs; the block at larger contexts is ingest, not residency.
+- Prefill (a chunk pipeline that launches no indexer above 2,048 positions, and therefore measures a ceiling rather than a correct context) is verified to 65,536 tokens at 698.2 tok/s. Building a real 262K context needs the indexer inside the chunked ingest; see `decode/receipts/22_70008_POSITIONS_AND_PREFILL_CEILING.md`.
+- Long prompt files must be built with the model's own tokenizer: **`decode/tools/p92_encode.cpp`** (`encode` / `chat` / `decode` / `check` / `ids`). Earlier long-context files were built with a different tokenizer and contained ids up to 154,841 against a 151,552-row embedding table, which makes their *content* meaningless even though their timings stand.
 - Measured decode through the chat CLI (greedy, MTP off): **67.5 tok/s at context 512**, **50.4 tok/s at 5,669** (19.83 ms/token), **48.9 tok/s at 43,135** (20.46 ms/token). The cost is a one-time step when the engine switches into sparse attention at 2,048 positions, not a linear scan: the 37,466 positions past 5,669 cost 0.63 ms/token, and the whole DSA index/select path is 0.5% of token time. Profile in `decode/receipts/20_DECODE_PROFILE_AND_PIPELINE_FINDING.md`.
 
 ## Model / license
