@@ -7,6 +7,24 @@ contains no Python, no framework runtime and no llama.cpp-derived execution path
 
 This repository contains source only. It contains no model weights. See `NOTICE`.
 
+## Backends
+
+This repository contains two native backends for the same model. **The decode
+rows differ in decode mode: the DGX Spark row uses MTP / speculative decoding;
+the AMD row is plain native target decode with MTP disabled.** MTP on AMD is
+experimental and is not part of the released claim (see amd-gfx906/docs/MTP_STATUS.md).
+
+| Backend | Hardware | Decode mode | MTP | Decode tok/s | Prefill tok/s | Status |
+|---|---|---|---:|---:|---:|---|
+| NVIDIA CUDA | DGX Spark GB10 | MTP / speculative | ON | 52.10 @ 123 ctx, 96 gen ("Explain probability in one clear sentence.") | 51.4 @ 3,807 tokens | preserved baseline |
+| NVIDIA CUDA | DGX Spark GB10 | plain target | OFF | 21.01 @ 331 ctx | 51.4 @ 3,807 tokens | preserved baseline |
+| AMD gfx906 | 4x MI50 / Pro VII | plain target | OFF | 69.92 @ 512 ctx, fixed token stream | 710 / 731 / 732 / 725 / 698 at 4K/8K/16K/32K/64K | current |
+
+The AMD decode measurement shown above does not use MTP or speculative decoding;
+the DGX Spark decode measurement shown above does.
+
+Full tables, methodology and sources: amd-gfx906/docs/BENCHMARKS.md.
+
 ## Model
 
 | property | value |
