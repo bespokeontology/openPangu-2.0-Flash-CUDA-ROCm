@@ -2,10 +2,11 @@
 
 **English** | [中文](README.zh.md) | [Русский](README.ru.md)
 
-A direct C++/CUDA inference engine for Huawei's `openPangu-2.0-Flash` (92B total
-parameters, ~6B active per token) targeting NVIDIA GB10 / SM 12.1a. The engine keeps
-the model fully resident, executes NVFP4 projections on Blackwell tensor cores, and
-contains no Python, no framework runtime and no llama.cpp-derived execution path.
+Direct native inference engines for Huawei's `openPangu-2.0-Flash` (92B total
+parameters, ~6B active per token). The original backend targets NVIDIA GB10 / SM 12.1a
+(C++/CUDA, NVFP4 projections on Blackwell tensor cores); the newer backend targets
+4x AMD MI50 / Radeon Pro VII, gfx906 (C++/HIP). Both keep the model fully resident, and
+neither contains Python, a framework runtime or a llama.cpp-derived execution path.
 
 This repository contains source only. It contains no model weights. See `NOTICE`.
 
