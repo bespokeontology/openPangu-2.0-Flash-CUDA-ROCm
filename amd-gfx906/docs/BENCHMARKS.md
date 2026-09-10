@@ -66,3 +66,9 @@ Absolute peak reference for the AMD cards: HBM streaming measured at
 - The AMD engine's MTP path is experimental and is not benchmarked in this
   release. `docs/MTP_STATUS.md` records what exists and what is a negative
   architectural result rather than a performance figure.
+
+**Release source-equivalence check:** the staged public AMD source was compared
+against the source trees used to build the frozen benchmark binaries. Code
+differences are limited to default filesystem paths and prefill include-path
+retargeting to identical source files; kernel code, launch geometry, numerical
+paths and gfx906 build flags are unchanged.
