@@ -47,8 +47,31 @@ sha256 `78c0b4c0438ef82e9a34c6f2ea73b835db4c78f50d5dabebbd668d5725efe4`) removes
 
 This turns a 93-minute ingest into a one-time cost that answers many questions, which
 is the whole usability argument for 262K context: you pay the ingest once and then
-ask. Its runtime verification (smoke test, then four questions in one 261,071-position
-session) is queued and reported next.
+ask.
+
+### Verified at runtime (smoke test, rc=0)
+
+A 130-token corpus with the amber and basalt needles, two questions piped in on
+stdin, 64 new tokens each. The server's own markers show positions advancing across
+requests — that is the context being reused, not rebuilt:
+
+```
+[serve] request 30 tokens, at position 194, budget 94
+[serve] request 30 tokens, at position 288, budget 94
+```
+
+Answer 1: `...the context given in the initial message: "The amber vault access code is 41-2739."`
+
+Answer 2, asked after request 1 had already been appended to the live context, with no
+re-ingest of any kind:
+```
+First, the user is asking for the access code for the basalt vault. I need to recall
+the information from the initial context provided in the conversation.
+The initial context says: "The basalt vault access code is 58-1904."
+```
+
+Both needles retrieved, in the second and third requests of one process, at 288
+positions of accumulated context.
 
 ## 3. Lock discipline held
 
