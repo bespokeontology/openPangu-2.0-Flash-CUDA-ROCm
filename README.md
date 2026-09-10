@@ -23,8 +23,9 @@ experimental and is not part of the released claim (see amd-gfx906/docs/MTP_STAT
 | NVIDIA CUDA | DGX Spark GB10 | plain target | OFF | 21.01 @ 331 ctx | 51.4 @ 3,807 tokens | preserved baseline |
 | AMD gfx906 | 4x MI50 / Pro VII | plain target | OFF | 69.92 @ 512 ctx, fixed token stream | 710 / 731 / 732 / 725 / 698 at 4K/8K/16K/32K/64K | current |
 
-The AMD decode measurement shown above does not use MTP or speculative decoding;
-the DGX Spark decode measurement shown above does.
+The 69.92 tok/s AMD measurement is plain target decode with MTP disabled. The
+52.10 tok/s DGX Spark measurement uses MTP/speculative decoding; the 21.01 tok/s
+DGX Spark measurement is plain target decode.
 
 Full tables, methodology and sources: amd-gfx906/docs/BENCHMARKS.md.
 
@@ -65,7 +66,7 @@ The catalog reads shards named `model-00001.safetensors` through
 `model-00050.safetensors`; shards that hold no required tensor may be empty but must
 be present and well formed.
 
-## Build
+## Build — NVIDIA CUDA
 
 Requires CUDA 13, a C++20 compiler, CUTLASS headers, FlashInfer headers and
 `libpcre2-8`.
@@ -82,7 +83,7 @@ Targets of interest: `p92_chat` (trunk decode), `p92_chat_mtp` (trunk plus the
 checkpoint's three-stage MTP predictor), `p92_tokenizer_test`,
 `p92_nvfp4_artifact_inspect`.
 
-## Run
+## Run — NVIDIA CUDA
 
 ```
 ./build/p92_chat     <auxiliary_checkpoint_dir> <nvfp4_artifact_dir> [max_context] [max_new]
@@ -90,6 +91,14 @@ checkpoint's three-stage MTP predictor), `p92_tokenizer_test`,
 ```
 
 Both read prompts from stdin and accept `/reset` and `/quit`.
+
+## Build and run — AMD gfx906
+
+The gfx906 backend builds from `amd-gfx906/` with `hipcc --offload-arch=gfx906`
+and has no dependencies beyond ROCm. The released decode binary is plain target
+decode (`p92_gen`, MTP disabled); the released prefill binary is `p92_pf_bench`.
+Exact commands, weight layout and the machine-lock requirement are in
+`amd-gfx906/README.md`.
 
 ## Measured
 
