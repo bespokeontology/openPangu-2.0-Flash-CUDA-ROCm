@@ -82,3 +82,15 @@ Run under the machine lock: `~/q27bench ./p92_pf_bench <checkpoint> <artifact> <
 Source only; no weights are included. See the repository `NOTICE` and
 `legal/` for upstream Huawei attribution and the OpenPangu Model License
 Agreement Version 2.0.
+
+## Chat (text in, text out)
+
+The decoder accepts text prompts directly; no token-id preparation and no Python.
+
+```
+echo "Explain Kolmogorov complexity in two sentences." | \
+  P92_TEMP=0.6 P92_TOPK=50 P92_TOPP=0.95 \
+  ~/q27bench ./p92_chat <checkpoint> <artifact> <arena> 160 4096 148899 -
+```
+
+argv[7] = "-" reads the prompt from stdin (chat template + BPE encode applied in-process); pass a path instead to feed int64 token ids. P92_TEMP=0 restores greedy argmax. See decode/receipts/19_CHAT_TEXT_MODE.md.
