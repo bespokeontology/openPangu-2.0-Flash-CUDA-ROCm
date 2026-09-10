@@ -1,4 +1,4 @@
-# openPangu Flash92 — native NVFP4 CUDA inference engine
+# openPangu Flash92 — native inference engines (CUDA / gfx906)
 
 **English** | [中文](README.zh.md) | [Русский](README.ru.md)
 
