@@ -24,3 +24,12 @@ steady decode 14.82 ms/token = 67.47 tok/s at context 512 (T=0.6, top-k 50, top-
 
 Sampling removes the repetition collapse the greedy path shows on this prompt family;
 greedy remains available for reproducing the historical rung.
+
+## Frozen
+
+| item | value |
+|---|---|
+| binary | p92_chat (frozen copy: /data/openpangu/frozen/p92-chat-20260910/p92_chat) |
+| sha256 | 43db03f408ca2be6ff1d83f853248bc0b1eb3f1eedafc7c96ce3d83022ac1eda  p92_chat |
+| built from | amd-gfx906/decode @ commit d14461c, hipcc --offload-arch=gfx906 -O3 |
+| sources | tests/p92_chat.hip, tools/p92_tokenizer.cpp, include/p92/tokenizer.h |
