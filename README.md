@@ -1,5 +1,7 @@
 # openPangu Flash92 — native NVFP4 CUDA inference engine
 
+**English** | [中文](README.zh.md) | [Русский](README.ru.md)
+
 A direct C++/CUDA inference engine for Huawei's `openPangu-2.0-Flash` (92B total
 parameters, ~6B active per token) targeting NVIDIA GB10 / SM 12.1a. The engine keeps
 the model fully resident, executes NVFP4 projections on Blackwell tensor cores, and

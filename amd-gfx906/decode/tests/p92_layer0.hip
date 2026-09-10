@@ -148,7 +148,7 @@ static Gate compare(const char*name,const std::vector<float>&got,const std::vect
 int main(int argc,char**argv){
     const char*CK  = argc>1?argv[1]:"./checkpoint";
     const char*ART = argc>2?argv[2]:"./artifact";
-    const char*CAP = argc>3?argv[3]:"./data/openpangu-oracle-capture"; (void)CAP;
+    const char*CAP = argc>3?argv[3]:"./srv/pangu-oracle-capture"; (void)CAP;
     const int TOKEN=148899;
     const int HID=2560, QLORA=1024, QUP=9216, KVLORA=512, ROPE=64, KVA=576;
 

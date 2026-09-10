@@ -1,7 +1,7 @@
 # OPENPANGU PREFILL — HANDOFF 2026-09-09 night
 
-Tree: `/data/openpangu/p92-prefill` on **amd-server** (4x MI50, gfx906).
-Frozen decode engine `/data/openpangu/p92-amd` — **never modify; copy to /tmp to patch.**
+Tree: `/srv/pangu/p92-prefill` on **amd-host** (4x MI50, gfx906).
+Frozen decode engine `/srv/pangu/p92-amd` — **never modify; copy to /tmp to patch.**
 
 ## 1. WHERE IT IS
 
@@ -17,7 +17,7 @@ Composed native prefill, all 46 layers, 4 cards, WITH the model's sparse DSA.
 
 Dense collapses with prompt length; sparse is near-flat. That is the whole result.
 
-## 2. FREEZES (binaries archived + SHA256 + RECEIPT, in `/data/openpangu/frozen/`)
+## 2. FREEZES (binaries archived + SHA256 + RECEIPT, in `/srv/pangu/frozen/`)
 
 `/tmp` is wiped at boot on both boxes. Never freeze there.
 
@@ -145,7 +145,7 @@ this handoff was written. **Resolve before quoting 602 as the authority number.*
   refusal), and its stray check `pgrep -x q27_gen` was blind to any other engine — a
   resident p92 pushed the peer's job into GTT host memory at ~1/100th speed and presented
   as a hang. It now asks the driver via `rocm-smi --showpids`. Backup at `~/q27bench.bak-20260909`.
-- Peer session address: `uds:/run/user/1000/cc-socks/1220071.sock`.
+- Peer session address: `<peer session socket>`.
 
 ## 10. ENV FLAGS
 

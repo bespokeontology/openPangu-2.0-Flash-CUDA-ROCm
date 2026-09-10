@@ -59,7 +59,7 @@ authority (banned as a gate).
 ## Frozen
 
 tag freeze-p92-prefill-spg2-20260909 -> 17d0fa9
-/data/openpangu/frozen/p92-prefill-spg2-20260909/p92_pf_bench
+/srv/pangu/frozen/p92-prefill-spg2-20260909/p92_pf_bench
 sha256 d5ad29f368d33d67bdcbae7dd7d12f2a53379bd55df0ddcc084c69fca503ae72
 
 ## Open

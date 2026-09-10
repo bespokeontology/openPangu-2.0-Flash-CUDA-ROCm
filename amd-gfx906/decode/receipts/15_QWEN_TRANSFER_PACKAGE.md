@@ -30,7 +30,7 @@ Bank the other backend's finding as a test case. Confirm or falsify it here.
 
 ## 1. Read these first
 
-All under `/data/openpangu/p92-amd/receipts/` on `amd-server`:
+All under `/srv/pangu/p92-amd/receipts/` on the AMD host:
 
     10_GFX906_PLAYBOOK.md    the hardware lessons. READ IN FULL. 7 sections.
     11_PROFILING_LAW.md      how measurement lies. Three named contaminations.
@@ -370,7 +370,7 @@ left over from an earlier geometry. Fix them when you find them.
 
 ## 6. Pangu code worth copying or adapting
 
-All under `/data/openpangu/p92-amd/src/` on `amd-server`.
+All under `/srv/pangu/p92-amd/src/` on the AMD host.
 
 | file | what to take | why |
 |---|---|---|
@@ -397,7 +397,7 @@ All under `/data/openpangu/p92-amd/src/` on `amd-server`.
     launch overhead 1.245 us; HIP graphs buy only ~15 percent of that
     P2P dead at the driver - three missing kernel config options, see 07_
 
-`ssh amd-server`. Do not touch `/data/openpangu/p92-amd` except read-only.
+`ssh <amd-host>`. Do not touch `/srv/pangu/p92-amd` except read-only.
 
 ## 8. The two rules that matter most
 
@@ -410,11 +410,11 @@ All under `/data/openpangu/p92-amd/src/` on `amd-server`.
 
 ## 9. Prior-art inventory, with what each is good for
 
-Everything below is on `amd-server` unless marked. **Read-only.**
+Everything below is on the AMD host unless marked. **Read-only.**
 
 ### 9.1 gfx906 HIP that already exists — start here
 
-`/home/kapitoshkinai/glmflash-hip/src/hip/` is GLM running on gfx906 in HIP. It
+`~/glmflash-hip/src/hip/` is GLM running on gfx906 in HIP. It
 is the closest precedent to what you are building: real AMD kernels for these
 exact cards, not CUDA to be translated.
 
@@ -432,7 +432,7 @@ exact cards, not CUDA to be translated.
 
 Sibling trees (`glmflash-amd40`, `glmflash-ep4`, `glmflash-dsa`,
 `glmflash-m3-*`, `glmflash-arenas`, `glmflash-appliance-moe`, and others under
-`/home/kapitoshkinai/`) are variants from that programme. `/data/glmflash-preserve`
+`~/`) are variants from that programme. `/srv/glmflash-preserve`
 is the preserved copy. Pangu's MLA decode was itself ported from the GLM gfx906
 tiled online-softmax kernel — that lineage already worked once.
 
@@ -447,7 +447,7 @@ programme was looking for it.
     /data/qwen38-27b/oracle_capture   captured oracle activations + reference
     /data/qwen38-27b/dflash-aligned-v5
 
-Plus the frozen Qwen states in `/home/kapitoshkinai/freeze/`:
+Plus the frozen Qwen states in `~/freeze/`:
 `FREEZE_QWEN_OVERNIGHT_20260907`, `FREEZE_QWEN_PREFILL_1543_20260906`,
 `FREEZE_QWEN_FORK_PROOF_20260906`.
 
@@ -467,10 +467,10 @@ the product, and not a bit-exact target.** See section 0.
 
 ### 9.4 Pangu
 
-`/data/openpangu/p92-amd` — this port. Section 1 lists the receipts, section 6
+`/srv/pangu/p92-amd` — this port. Section 1 lists the receipts, section 6
 the kernels worth copying.
 
-`/data/openpangu/engine/openpangu-flash92-native` — the CUDA oracle for Pangu.
+`/srv/pangu/engine/openpangu-flash92-native` — the CUDA oracle for Pangu.
 Its receipts are worth reading even for Qwen, because they record what Huawei
 and the CUDA port measured about MoE/expert execution: grouped-GEMM shapes,
 expert batching, shared-expert fusion, reordering by (projection, expert), and
