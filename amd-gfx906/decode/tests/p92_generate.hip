@@ -23,6 +23,7 @@
 #include "../src/p92_mla_split.hip"
 #include "../src/p92_mla_g16.hip"
 #include "../src/p92_dsa_index.hip"
+#include "../src/p92_dsa_scores2.hip"
 #include "../src/p92_dense.hip"
 #include "../src/p92_head.hip"
 #include "../src/p92_router.hip"
@@ -496,6 +497,11 @@ int main(int argc,char**argv){
             hipLaunchKernelGGL(k_p92_ix_query,dim3(24),dim3(128),0,0,c.qidx,c.cosv,c.sinv);
             hipLaunchKernelGGL((k_p92_bf16_gemv<2560>),dim3((24+3)/4),dim3(256),0,0,
                                (const p92_pbf*)w.ix_wproj,c.norm,c.wh);
+            if(getenv("P92_IDX_SCORER") && atoi(getenv("P92_IDX_SCORER"))==2)
+                hipLaunchKernelGGL(k_p92_idx_scores_v2,dim3((npos+63)/64),dim3(256),0,0,
+                                   c.qidx,(const p92_bf*)w.ix_cache,c.wh,w.cap,npos,
+                                   1.0f/sqrtf((float)P92_IDX_DIM),c.scores);
+            else
             hipLaunchKernelGGL(k_p92_idx_scores,dim3((npos+255)/256),dim3(256),0,0,
                                c.qidx,(const p92_bf*)w.ix_cache,c.wh,w.cap,npos,
                                1.0f/sqrtf((float)P92_IDX_DIM),c.scores);
