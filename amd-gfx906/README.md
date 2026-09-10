@@ -81,7 +81,7 @@ Run under the machine lock: `~/q27bench ./p92_pf_bench <checkpoint> <artifact> <
 
 - **Supported prompt context: 62,144 tokens** (the decode engine sizes its DSA caches from the `MAXPOS` argument; 62,144/pass it as the 5th argument).
 - Prefill is verified to 65,536 tokens at 698.2 tok/s (TTFT 0.65 s); 128K and 256K exceed VRAM on the 4x16 GB configuration.
-- Measured decode through the chat CLI (greedy, MTP off): **67.47 tok/s at context 512**, **50.4 tok/s at context 5,669** (19.83 ms/token). The DSA index scan is O(context) per token, so the rate falls with length; a 62,144-token run is in progress to extend the curve.
+- Measured decode through the chat CLI (greedy, MTP off): **67.5 tok/s at context 512**, **50.4 tok/s at 5,669** (19.83 ms/token), **48.9 tok/s at 43,135** (20.46 ms/token). The cost is a one-time step when the engine switches into sparse attention at 2,048 positions, not a linear scan: the 37,466 positions past 5,669 cost 0.63 ms/token, and the whole DSA index/select path is 0.5% of token time. Profile in `decode/receipts/20_DECODE_PROFILE_AND_PIPELINE_FINDING.md`.
 
 ## Model / license
 
