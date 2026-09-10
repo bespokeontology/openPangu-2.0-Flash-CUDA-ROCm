@@ -143,7 +143,7 @@ agents working under operator direction, on the operator hardware:
 
 - **NVIDIA DGX Spark CUDA backend** (this repository, root): Claude (Anthropic)
   agent sessions.
-- **AMD gfx906 backend** (`amd-gfx906/`): the DeepSeek V4 Flash harness agent -
+- **AMD gfx906 backend** (`amd-gfx906/`): the DeepSeek V4.1 Flash harness agent -
   G2TQ1 head-shared sparse attention (SPG2), the packed-selection consumer, the
   MTP NVFP4 artifact and quantizer, the native three-head draft path and
   speculative state machine, and this publication.
