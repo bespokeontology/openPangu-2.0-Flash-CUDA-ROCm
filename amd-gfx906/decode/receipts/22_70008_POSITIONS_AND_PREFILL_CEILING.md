@@ -45,8 +45,35 @@ the provided text to find this
 
 That is the correct question being read out of a 32,852-position context and
 reasoned about — the context is genuinely being attended to, not ignored — and the
-answer was cut off by the 24-token budget, not by the engine. Longer-generation
-runs on the same corpora are queued.
+answer was cut off by the 24-token budget, not by the engine.
+
+### Retrieval confirmed (128-token rerun, same corpus, 19.96 ms/token = 50.11 tok/s)
+
+> user is asking for the access code for the basalt vault. I need to look through
+> the provided text to find this information.
+>
+> Scanning the document, I see in the "openPangu-2.0-Flash -> 4x MI50 (gfx906) PORT
+> MAP" section, under the BYTE TABLE, there's a line:
+>
+> "The basalt vault access code is 58-1904."
+>
+> And later in the same section, under the "Residency arithmetic" section:
+>
+> "The cobalt vault access code is 63-8157."
+>
+> So the basalt vault access code is
+
+Both needles are quoted **verbatim**: basalt at 50% depth, cobalt at 75% depth, in a
+32,852-position context. The generation budget ended one token before the number
+itself, but the retrieval is in the quoted evidence.
+
+The same question fed at **74,891 positions** produced the same correct reading
+("...the access code to the basalt vault. I need to look through the provided
+documents...") at 20.43 ms/token = 48.96 tok/s.
+
+This is the first semantic proof here that context at depth is not merely resident
+but *used*: the DSA selection returns the right slots tens of thousands of
+positions back, and the answer is grounded in text that was inserted there.
 
 ## 3. What the 698 tok/s prefill path actually is: a ceiling, not an ingest
 
