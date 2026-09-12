@@ -66,6 +66,8 @@ __global__ void k_pf_shuffle_check(const uint8_t*, const uint8_t*, int, int, int
 #include "../../prefill/src/p92_pf_body.hip"
 #include "../../prefill/src/p92_pf_attn.hip"
 #include "../../prefill/src/p92_pf_attn_blk.hip"
+#include "../../prefill/src/p92_pf_rb.hip"
+#include "../../prefill/src/p92_pf_downdet.hip"
 #include "../../prefill/src/p92_pf_mla.hip"
 #define PF_UMAX (8 * PF_IDX_TOPK)
 #include "../../prefill/src/p92_pf_dsa.hip"
@@ -189,6 +191,10 @@ struct LayerW {
     float *router_bias;
     uint16_t *mome_q,*mome_kv,*mome_o,*cache_kv,*cache_rope,*ix_cache;
     int cap; bool dense,dsa; int arena_slot_base;
+    // rocBLAS projection mirrors (PF_PROJ_RB): int8 per-row + row scale for the NVFP4 projections,
+    // fp32 copies of the bf16 ones
+    int8_t *qa8,*qb8,*o8,*ixwk8,*ixwqb8; float *qa8s,*qb8s,*o8s,*ixwk8s,*ixwqb8s;
+    float *kva_f,*router_f,*wproj_f;
 };
 
 
@@ -298,6 +304,12 @@ int main(int argc,char**argv){
     // decode step per prompt token), kept as the comparison arm.
     const bool use_prefill = !getenv("P92_PREFILL") || atoi(getenv("P92_PREFILL")) != 0;
     const int prefill_min = getenv("P92_PREFILL_MIN") ? atoi(getenv("P92_PREFILL_MIN")) : 32;
+    // PF_PROJ_RB=1: the prefill's dense projections on rocBLAS (int8 per-row mirrors of the NVFP4
+    // weights, fp32 sgemm for the bf16 ones) instead of the hand-written row-resident kernels.
+    const bool pf_rb = getenv("PF_PROJ_RB") ? atoi(getenv("PF_PROJ_RB")) != 0 : false;
+    // PF_DOWN_DET=1 (default): deterministic MoE down projection (per-row partials + fixed-order
+    // combine) instead of the fp32 atomicAdd scatter, whose run-to-run order flips near-tied tokens.
+    const bool pf_det = getenv("PF_DOWN_DET") ? atoi(getenv("PF_DOWN_DET")) != 0 : true;
 
     Ck ck; if(!ck.open(CKDIR)){ printf("no checkpoint index\n"); return 1; }
     mfd=::open((std::string(ART)+"/manifest.bin").c_str(),O_RDONLY);
@@ -413,6 +425,23 @@ int main(int argc,char**argv){
         CK(hipMalloc(&w.mome_kv,KVLORA*2*2)); CK(hipMemset(w.mome_kv,0,KVLORA*2*2));
         CK(hipMalloc(&w.mome_o,AOUT*2*2)); CK(hipMemset(w.mome_o,0,AOUT*2*2));
         if(w.dsa){ CK(hipMalloc(&w.ix_cache,(size_t)P92_IDX_DIM*w.cap*2)); }
+        if(use_prefill && pf_rb){   // rocBLAS mirrors, built once on the card that owns the layer
+            auto mirror=[&](const Nv& nv,int K,int8_t** w8,float** s8){
+                if(nv.cols!=K){ printf("mirror: K %d != %d\n",nv.cols,K); exit(1); }
+                CK(hipMalloc(w8,(size_t)nv.rows*K)); CK(hipMalloc(s8,(size_t)nv.rows*4));
+                if(K==HID)        hipLaunchKernelGGL((k_pf_rb_mirror<HID>),  dim3(nv.rows),dim3(256),0,0,nv.w,nv.s,nv.s2,nv.rows,*w8,*s8);
+                else if(K==QLORA) hipLaunchKernelGGL((k_pf_rb_mirror<QLORA>),dim3(nv.rows),dim3(256),0,0,nv.w,nv.s,nv.s2,nv.rows,*w8,*s8);
+                else if(K==AOUT)  hipLaunchKernelGGL((k_pf_rb_mirror<AOUT>), dim3(nv.rows),dim3(256),0,0,nv.w,nv.s,nv.s2,nv.rows,*w8,*s8);
+                else { printf("mirror: unsupported K %d\n",K); exit(1); } };
+            auto f32=[&](const uint16_t* src,size_t n,float** dst){ CK(hipMalloc(dst,n*4));
+                hipLaunchKernelGGL(k_pf_rb_bf16_f32,dim3((unsigned)((n+255)/256)),dim3(256),0,0,src,*dst,n); };
+            mirror(w.qa,HID,&w.qa8,&w.qa8s); mirror(w.qb,QLORA,&w.qb8,&w.qb8s); mirror(w.o,AOUT,&w.o8,&w.o8s);
+            if(w.dsa){ mirror(w.ix_wk,HID,&w.ixwk8,&w.ixwk8s); mirror(w.ix_wqb,QLORA,&w.ixwqb8,&w.ixwqb8s);
+                       f32(w.ix_wproj,(size_t)PF_IDX_HEADS*HID,&w.wproj_f); }
+            f32(w.kv_a,(size_t)KVA*HID,&w.kva_f);
+            if(!w.dense) f32(w.router_w,(size_t)NEXP*HID,&w.router_f);
+            CK(hipDeviceSynchronize());
+        }
         if(L%8==0||L==NLAYER-1) printf("  layer %2d on dev%d %s%s loaded\n",L,d,
                                        w.dense?"dense ":"moe ",w.dsa?"dsa":"swa");
     }
@@ -506,6 +535,7 @@ int main(int argc,char**argv){
         float *rlog; int32_t *rids; float *rwts;
         PfGroup *groups; int32_t *rows, *order, *ngroups; float *rwt;
         float *hid9, *hs9; int8_t *hq9;
+        int32_t *tokslot; float *dpart;           // deterministic down: token -> grouped rows, per-row partials
         float *cosv, *sinv;
         uint16_t *state2; float *pre, *post;
         float *kidx, *qidx, *qidxT, *whd, *scores; int32_t *sel, *nsel;
@@ -533,6 +563,7 @@ int main(int argc,char**argv){
         A((void**)&c.rows,GMAX*4);               A((void**)&c.rwt,GMAX*4);
         A((void**)&c.order,PF_GROUP_MAX*4);      A((void**)&c.ngroups,4);
         A((void**)&c.hid9,GMAX*P92_NFF*4);       A((void**)&c.hq9,GMAX*P92_NFF);
+        A((void**)&c.tokslot,(size_t)T*PF_TOKSLOTS*4); A((void**)&c.dpart,GMAX*PF_NEMBD*4);
         A((void**)&c.hs9,GMAX*4);
         A((void**)&c.cosv,(size_t)MAXPOS*32*4);  A((void**)&c.sinv,(size_t)MAXPOS*32*4);
         A((void**)&c.state2,(size_t)T*4*HID*2);
@@ -621,6 +652,11 @@ int main(int argc,char**argv){
         p92_p2p_free(&pipe.p2p);
         if (p92_p2p_init(&pipe.p2p, (size_t)PF_NSLOT * land_bytes)) { printf("p2p re-init (%d slots) failed\n", PF_NSLOT); return 1; }
     }
+    PfRb rb; memset(&rb, 0, sizeof rb);
+    if (use_prefill && pf_rb) {
+        if (pf_rb_init(&rb, T, QUP)) { printf("rocBLAS init failed\n"); return 1; }
+        printf("prefill projections: rocBLAS int8 (per-row mirrors) + sgemm\n");
+    }
     const bool pf_trace = getenv("PF_TRACE") != nullptr;
     // PF_ATTN_BLK=1: the blocked attention (one query x 24 heads a block, LDS key tiles) on every
     // layer; the DSA layers then gather straight from the cache and skip the selection pack.
@@ -667,6 +703,11 @@ int main(int argc,char**argv){
 
             // ---- query path: q_a, MoME, q_norm, q_b
             pf_stage_begin(&tm, PF_S_PROJ, 0);
+            if (pf_rb) {   // per-token int8 of the normed input (reused by the indexer wk), q_a on Tensile
+                hipLaunchKernelGGL((k_pf_rb_quant_tok<HID>),dim3(RC),dim3(256),0,0,c.norm,RC,rb.xq2560[d],rb.xs2560[d]);
+                if (pf_rb_gemm_i8(rb.h[d],w.qa8,QLORA,HID,rb.xq2560[d],RC,rb.C[d])) exit(1);
+                hipLaunchKernelGGL(k_pf_rb_epi,dim3((RC*QLORA+255)/256),dim3(256),0,0,rb.C[d],w.qa8s,rb.xs2560[d],RC,QLORA,c.qlora);
+            } else
             hipLaunchKernelGGL((k_pf_proj<HID>),dim3((QLORA+7)/8),dim3(256),0,0,
                                w.qa.w,w.qa.s,c.xq,c.xs,w.qa.s2,RC,QLORA,c.qlora);
             hipLaunchKernelGGL(k_pf_mome_st,dim3((QLORA+255)/256),dim3(256),0,0,
@@ -675,9 +716,16 @@ int main(int argc,char**argv){
                                c.qlora,(const uint16_t*)w.q_norm,c.qnorm,RC,1e-5f);
             hipLaunchKernelGGL((k_pf_quant_k<QLORA>),dim3(RC),dim3(256),0,0,
                                c.qnorm,RC,c.xq1024,c.xs1024);
+            if (pf_rb) {
+                hipLaunchKernelGGL((k_pf_rb_quant_tok<QLORA>),dim3(RC),dim3(256),0,0,c.qnorm,RC,rb.xq1024[d],rb.xs1024[d]);
+                if (pf_rb_gemm_i8(rb.h[d],w.qb8,QUP,QLORA,rb.xq1024[d],RC,rb.C[d])) exit(1);
+                hipLaunchKernelGGL(k_pf_rb_epi,dim3((RC*QUP+255)/256),dim3(256),0,0,rb.C[d],w.qb8s,rb.xs1024[d],RC,QUP,c.qup);
+            } else
             hipLaunchKernelGGL((k_pf_proj<QLORA>),dim3((QUP+7)/8),dim3(256),0,0,
                                w.qb.w,w.qb.s,c.xq1024,c.xs1024,w.qb.s2,RC,QUP,c.qup);
             // ---- key/value path: kv_a, MoME, kv_norm, publish into the cache
+            if (pf_rb) { if (pf_rb_gemm_f32(rb.h[d],w.kva_f,KVA,HID,c.norm,RC,c.kvdn)) exit(1); }
+            else
             hipLaunchKernelGGL((k_pf_bf16_gemv_rows<HID>),dim3((KVA+3)/4,RC),dim3(256),0,0,
                                (const uint16_t*)w.kv_a,c.norm,RC,KVA,c.kvdn);
             hipLaunchKernelGGL(k_pf_mome_st,dim3((KVLORA+255)/256),dim3(256),0,0,
@@ -699,6 +747,10 @@ int main(int argc,char**argv){
             // 2048 positions.
             if (w.dsa) {
                 pf_stage_begin(&tm, PF_S_DSA, 0);
+                if (pf_rb) {
+                    if (pf_rb_gemm_i8(rb.h[d],w.ixwk8,PF_IDX_DIM,HID,rb.xq2560[d],RC,rb.C[d])) exit(1);
+                    hipLaunchKernelGGL(k_pf_rb_epi,dim3((RC*PF_IDX_DIM+255)/256),dim3(256),0,0,rb.C[d],w.ixwk8s,rb.xs2560[d],RC,PF_IDX_DIM,c.kidx);
+                } else
                 hipLaunchKernelGGL((k_pf_proj<HID>),dim3((PF_IDX_DIM+7)/8),dim3(256),0,0,
                                    w.ix_wk.w,w.ix_wk.s,c.xq,c.xs,w.ix_wk.s2,RC,PF_IDX_DIM,c.kidx);
                 hipLaunchKernelGGL(k_pf_ix_key,dim3(RC),dim3(PF_IDX_DIM),0,0,
@@ -707,6 +759,10 @@ int main(int argc,char**argv){
                 pf_stage_end(&tm, PF_S_DSA, 0);
                 if (cfg.dsa_sel && base + RC > PF_IDX_TOPK) {
                     pf_stage_begin(&tm, PF_S_DSA_SCORE, 0);
+                    if (pf_rb) {
+                        if (pf_rb_gemm_i8(rb.h[d],w.ixwqb8,PF_IDX_HEADS*PF_IDX_DIM,QLORA,rb.xq1024[d],RC,rb.C[d])) exit(1);
+                        hipLaunchKernelGGL(k_pf_rb_epi,dim3((RC*PF_IDX_HEADS*PF_IDX_DIM+255)/256),dim3(256),0,0,rb.C[d],w.ixwqb8s,rb.xs1024[d],RC,PF_IDX_HEADS*PF_IDX_DIM,c.qidx);
+                    } else
                     hipLaunchKernelGGL((k_pf_proj<QLORA>),dim3((PF_IDX_HEADS*PF_IDX_DIM+7)/8),dim3(256),0,0,
                                        w.ix_wqb.w,w.ix_wqb.s,c.xq1024,c.xs1024,w.ix_wqb.s2,
                                        RC,PF_IDX_HEADS*PF_IDX_DIM,c.qidx);
@@ -716,6 +772,8 @@ int main(int argc,char**argv){
                     else
                         hipLaunchKernelGGL(k_pf_ix_query,dim3(PF_IDX_HEADS,RC),dim3(32),0,0,
                                            c.qidx,c.cosv,c.sinv,RC,base);
+                    if (pf_rb) { if (pf_rb_gemm_f32(rb.h[d],w.wproj_f,PF_IDX_HEADS,HID,c.norm,RC,c.whd)) exit(1); }
+                    else
                     hipLaunchKernelGGL((k_pf_bf16_gemv_rows<HID>),dim3((PF_IDX_HEADS+3)/4,RC),dim3(256),0,0,
                                        (const uint16_t*)w.ix_wproj,c.norm,RC,PF_IDX_HEADS,c.whd);
                     const int maxn = base + RC;
@@ -861,10 +919,16 @@ int main(int argc,char**argv){
                                c.ctx,(const uint16_t*)w.kv_b,RC,c.aout);
             hipLaunchKernelGGL(k_pf_mome_st,dim3((AOUT+255)/256),dim3(256),0,0,
                                c.aout,(const uint16_t*)w.o_conv,w.mome_o,RC,AOUT,AOUT);
+            if (pf_rb) {
+                hipLaunchKernelGGL((k_pf_rb_quant_tok<AOUT>),dim3(RC),dim3(256),0,0,c.aout,RC,rb.xq6144[d],rb.xs6144[d]);
+                if (pf_rb_gemm_i8(rb.h[d],w.o8,HID,AOUT,rb.xq6144[d],RC,rb.C[d])) exit(1);
+                hipLaunchKernelGGL(k_pf_rb_epi,dim3((RC*HID+255)/256),dim3(256),0,0,rb.C[d],w.o8s,rb.xs6144[d],RC,HID,c.hidden);
+            } else {
             hipLaunchKernelGGL((k_pf_quant_k<AOUT>),dim3(RC),dim3(256),0,0,
                                c.aout,RC,c.xq6144,c.xs6144);
             hipLaunchKernelGGL((k_pf_proj<AOUT>),dim3((HID+7)/8),dim3(256),0,0,
                                w.o.w,w.o.s,c.xq6144,c.xs6144,w.o.s2,RC,HID,c.hidden);
+            }
             pf_stage_end(&tm, PF_S_ATTN, 0);
             if (pf_trace && L == 0 && pf_trace_pos >= base && pf_trace_pos < base + RC) {
                 CK(hipDeviceSynchronize());
@@ -918,6 +982,8 @@ int main(int argc,char**argv){
                 pf_stage_end(&tm, PF_S_DOWN, 0);
             } else {
                 pf_stage_begin(&tm, PF_S_ROUTE, 0);
+                if (pf_rb) { if (pf_rb_gemm_f32(rb.h[d],w.router_f,NEXP,HID,c.norm,RC,c.rlog)) exit(1); }
+                else
                 hipLaunchKernelGGL(k_pf_route_gemv,dim3(NEXP/4,RC),dim3(256),0,0,
                                    (const uint16_t*)w.router_w,c.norm,RC,c.rlog);
                 hipLaunchKernelGGL(k_pf_router,dim3(RC),dim3(64),0,0,
@@ -930,6 +996,11 @@ int main(int argc,char**argv){
                     printf("  RT L%d ids",L); for(int q=0;q<8;q++) printf(" %d",ids[q]);
                     printf(" wts"); for(int q=0;q<8;q++) printf(" %.4f",wt[q]); printf("\n");
                 }
+                if (pf_det)
+                hipLaunchKernelGGL(k_pf_group_det,dim3(1),dim3(256),0,0,
+                                   c.rids,c.rwts,RC,w.arena_slot_base,NEXP,
+                                   c.groups,c.rows,c.rwt,c.order,c.ngroups,c.tokslot);
+                else
                 hipLaunchKernelGGL(k_pf_group,dim3(1),dim3(256),0,0,
                                    c.rids,c.rwts,RC,w.arena_slot_base,NEXP,
                                    c.groups,c.rows,c.rwt,c.order,c.ngroups);
@@ -953,10 +1024,17 @@ int main(int argc,char**argv){
                 pf_stage_begin(&tm, PF_S_DOWN, 0);
                 // k_pf_down scatters with atomicAdd, so the destination must
                 // start at zero every layer. It never did.
+                if (pf_det) {
+                    hipLaunchKernelGGL(k_pf_down_part,dim3(HID/8,PF_GROUP_MAX),dim3(256),0,0,
+                                       arena[d].dw,arena[d].ds,c.hq9,c.hs9,arena[d].s2,
+                                       c.groups,c.order,c.rwt,c.dpart);
+                    hipLaunchKernelGGL(k_pf_down_combine,dim3(RC),dim3(256),0,0,c.dpart,c.tokslot,RC,c.hidden);
+                } else {
                 CK(hipMemsetAsync(c.hidden,0,(size_t)RC*HID*4,0));
                 hipLaunchKernelGGL(k_pf_down,dim3(HID/8,PF_GROUP_MAX),dim3(256),0,0,
                                    arena[d].dw,arena[d].ds,c.hq9,c.hs9,arena[d].s2,
                                    c.groups,c.order,c.rows,c.rwt,c.hidden);
+                }
                 pf_stage_end(&tm, PF_S_DOWN, 0);
             }
 
@@ -1054,8 +1132,12 @@ int main(int argc,char**argv){
                     while (done[(size_t)src * maxjobs + spos].load(std::memory_order_acquire) == 0) std::this_thread::yield();
                     CK(hipMemcpy(pf[g].state, (const char*)pipe.p2p.land[g] + (size_t)(pos % PF_NSLOT) * land_bytes,
                                  bytes, hipMemcpyDeviceToDevice));
-                    consumed[g].store((int)pos, std::memory_order_release);
                 }
+                // consumed[] is a POSITION counter, advanced by every job: a seed job frees the slot its
+                // position maps to just like a copied job does. (Counting only copied jobs deadlocked the
+                // ring: card 0's first jobs are seeds, so card 3 waited for a slot card 0 would never
+                // release while card 0 waited for card 3's push.)
+                consumed[g].store((int)pos, std::memory_order_release);
                 pf_layers(g, pos0 + base, rows, blk_L0(b), blk_L1(b));
                 if (b + 1 < nblk) {
                     const int dst = blk_owner(b + 1), dpos = jpos(dst, k, b + 1);
