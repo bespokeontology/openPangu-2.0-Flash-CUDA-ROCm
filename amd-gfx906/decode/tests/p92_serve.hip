@@ -66,11 +66,23 @@ __global__ void k_pf_shuffle_check(const uint8_t*, const uint8_t*, int, int, int
 #include "../../prefill/src/p92_pf_body.hip"
 #include "../../prefill/src/p92_pf_attn.hip"
 #include "../../prefill/src/p92_pf_attn_blk.hip"
+#include "../../prefill/src/p92_pf_attn_blk2.hip"
 #include "../../prefill/src/p92_pf_rb.hip"
 #include "../../prefill/src/p92_pf_downdet.hip"
 #include "../../prefill/src/p92_pf_mla.hip"
 #define PF_UMAX (8 * PF_IDX_TOPK)
 #include "../../prefill/src/p92_pf_dsa.hip"
+
+// Decode crossing as a device-side chain: the producer card STORES the 20 KB four-stream state
+// straight into the consumer card's buffer (peer write, the fast direction) and records an event;
+// the consumer's stream waits on that event. No host synchronisation anywhere in the token loop
+// until the head, so no drained-queue launches at every crossing (3 on the contiguous map, 11 on
+// the ring map).
+__global__ void __launch_bounds__(256)
+k_pe_copy16(const uint4 *__restrict__ src, uint4 *__restrict__ dst, int n4) {
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n4) dst[i] = src[i];
+}
 
 // Inverse of k_pf_shuffle_scales_gu/dn: the per-16 expert scales back to the arena's own
 // order, which the decode expert kernels read. per_row 160 / fan 5 for gate,up; 64 / 2 for down.
@@ -310,6 +322,14 @@ int main(int argc,char**argv){
     // PF_DOWN_DET=1 (default): deterministic MoE down projection (per-row partials + fixed-order
     // combine) instead of the fp32 atomicAdd scatter, whose run-to-run order flips near-tied tokens.
     const bool pf_det = getenv("PF_DOWN_DET") ? atoi(getenv("PF_DOWN_DET")) != 0 : true;
+    // P92_CHAIN=1 (default): decode crossings as a device-side chain (peer store + cross-device
+    // event wait) instead of a host sync + pinned staging per crossing.
+    const bool dec_chain = getenv("P92_CHAIN") ? atoi(getenv("P92_CHAIN")) != 0 : true;
+    // PF_ATTN_BLK=1: the blocked attention (one query x 24 heads a block, LDS key tiles) on every
+    // layer; the DSA layers then gather straight from the cache and skip the selection pack (and
+    // the 584 MB a card of packed streams is not allocated).
+    const int  pf_blk_mode = getenv("PF_ATTN_BLK") ? atoi(getenv("PF_ATTN_BLK")) : 0;   // 1 = v1 (bf16 tiles), 2 = v2 (fp16 tiles, dot2)
+    const bool pf_blk = pf_blk_mode != 0;
 
     Ck ck; if(!ck.open(CKDIR)){ printf("no checkpoint index\n"); return 1; }
     mfd=::open((std::string(ART)+"/manifest.bin").c_str(),O_RDONLY);
@@ -464,6 +484,9 @@ int main(int argc,char**argv){
 
     P92Transport tx;
     if(p92_transport_init(&tx,0)){ printf("transport init failed\n"); return 1; }
+    hipEvent_t xev[4];
+    for(int a=0;a<4;a++){ CK(hipSetDevice(a)); CK(hipEventCreateWithFlags(&xev[a],hipEventDisableTiming));
+        for(int b=0;b<4;b++) if(a!=b){ hipError_t pe=hipDeviceEnablePeerAccess(b,0); if(pe!=hipSuccess&&pe!=hipErrorPeerAccessAlreadyEnabled){ printf("peer access %d->%d: %s\n",a,b,hipGetErrorString(pe)); return 1; } (void)hipGetLastError(); } }
 
     printf("\nready. generating %d tokens from %d\n\n", NTOK, START);
 
@@ -592,9 +615,11 @@ int main(int argc,char**argv){
         // T*PF_IDX_TOPK slots a layer; a slot is 1024 B lat + 128 B pe + 16 B
         // mask. 612 MB a card at chunk 256 - the price of turning the scattered
         // union walk into three sequential streams.
+        if (!pf_blk) {
         A((void**)&c.lat_pack,(size_t)T*PF_IDX_TOPK*KVLORA*2);
         A((void**)&c.pe_pack,(size_t)T*PF_IDX_TOPK*ROPE*2);
         A((void**)&c.mask_pack,(size_t)T*PF_IDX_TOPK*16);
+        } else { c.lat_pack = nullptr; c.pe_pack = nullptr; c.mask_pack = nullptr; }
         A((void**)&c.packoff,(size_t)((T+1)/2)*4);
         // the RoPE table covers every position in the run and is built once
         hipLaunchKernelGGL(k_pf_rope_table,dim3(MAXPOS),dim3(64),0,0,c.cosv,c.sinv,MAXPOS);
@@ -658,9 +683,6 @@ int main(int argc,char**argv){
         printf("prefill projections: rocBLAS int8 (per-row mirrors) + sgemm\n");
     }
     const bool pf_trace = getenv("PF_TRACE") != nullptr;
-    // PF_ATTN_BLK=1: the blocked attention (one query x 24 heads a block, LDS key tiles) on every
-    // layer; the DSA layers then gather straight from the cache and skip the selection pack.
-    const bool pf_blk = getenv("PF_ATTN_BLK") ? atoi(getenv("PF_ATTN_BLK")) != 0 : false;
     const bool pf_ustats = getenv("PF_UNION_STATS") != nullptr;
     std::vector<int> ustat_u, ustat_n; std::mutex ustat_mx;
     const int pf_trace_pos = getenv("PF_TRACE_POS") ? atoi(getenv("PF_TRACE_POS")) : 0;
@@ -851,7 +873,14 @@ int main(int argc,char**argv){
 
             pf_stage_begin(&tm, PF_S_ATTN, 0);
             const bool sparse_ok = w.dsa && cfg.dsa_sel && (base + RC > PF_IDX_TOPK);
-            if (pf_blk) {
+            if (pf_blk_mode == 2) {
+                hipLaunchKernelGGL(k_pf_attn_blk2,dim3(RC,PF_NH/PFB2_HB),dim3(PFB2_NT),0,0,
+                                   c.qabs,c.qrope,(const uint16_t*)w.cache_kv,(const uint16_t*)w.cache_rope,
+                                   (const uint16_t*)w.sink_kv_n,(const uint16_t*)w.sink_rope,
+                                   sparse_ok ? (const int32_t*)c.sel : (const int32_t*)nullptr,
+                                   sparse_ok ? (const int32_t*)c.nsel : (const int32_t*)nullptr,
+                                   PF_IDX_TOPK, base, RC, sparse_ok ? 0 : win, c.ctx);
+            } else if (pf_blk) {
                 hipLaunchKernelGGL(k_pf_attn_blk,dim3(RC,PF_NH/PFB_HB),dim3(PFB_NT),0,0,
                                    c.qabs,c.qrope,(const uint16_t*)w.cache_kv,(const uint16_t*)w.cache_rope,
                                    (const uint16_t*)w.sink_kv_n,(const uint16_t*)w.sink_rope,
@@ -1398,10 +1427,19 @@ int main(int argc,char**argv){
         for(int L=0;L<NLAYER;L++){
             const int d=owner(L);
             if(d!=cur){
-                CK(hipSetDevice(cur)); CK(hipDeviceSynchronize());
-                if(p92_transport_send(&tx,cur,sc[cur].sa)) exit(1);
-                if(p92_transport_recv_to(&tx,cur,d,sc[d].sa)) exit(1);
-                if(p92_transport_wait(&tx,d)) exit(1);
+                if(dec_chain){
+                    CK(hipSetDevice(cur));
+                    hipLaunchKernelGGL(k_pe_copy16,dim3((4*HID*2/16+255)/256),dim3(256),0,0,
+                                       (const uint4*)sc[cur].sa,(uint4*)sc[d].sa,4*HID*2/16);
+                    CK(hipEventRecord(xev[cur],0));
+                    CK(hipSetDevice(d));
+                    CK(hipStreamWaitEvent(0,xev[cur],0));
+                } else {
+                    CK(hipSetDevice(cur)); CK(hipDeviceSynchronize());
+                    if(p92_transport_send(&tx,cur,sc[cur].sa)) exit(1);
+                    if(p92_transport_recv_to(&tx,cur,d,sc[d].sa)) exit(1);
+                    if(p92_transport_wait(&tx,d)) exit(1);
+                }
                 cur=d;
             }
             CK(hipSetDevice(d));

@@ -122,24 +122,6 @@ struct PfRb {
     int      ok;
 };
 
-static int pf_rb_init(PfRb *rb, int T, int nmax) {
-    rb->ok = 0;
-    for (int d = 0; d < 4; d++) {
-        if (hipSetDevice(d) != hipSuccess) return -1;
-        if (rocblas_create_handle(&rb->h[d]) != rocblas_status_success) { fprintf(stderr, "rocblas_create_handle(%d) failed\n", d); return -1; }
-        if (rocblas_set_stream(rb->h[d], 0) != rocblas_status_success) return -1;
-        if (hipMalloc(&rb->C[d], (size_t)T * nmax * 4) != hipSuccess) return -1;
-        if (hipMalloc(&rb->xq2560[d], (size_t)T * 2560) != hipSuccess) return -1;
-        if (hipMalloc(&rb->xq1024[d], (size_t)T * 1024) != hipSuccess) return -1;
-        if (hipMalloc(&rb->xq6144[d], (size_t)T * 6144) != hipSuccess) return -1;
-        if (hipMalloc(&rb->xs2560[d], (size_t)T * 4) != hipSuccess) return -1;
-        if (hipMalloc(&rb->xs1024[d], (size_t)T * 4) != hipSuccess) return -1;
-        if (hipMalloc(&rb->xs6144[d], (size_t)T * 4) != hipSuccess) return -1;
-    }
-    rb->ok = 1;
-    return 0;
-}
-
 // int8 GEMM: C[M][N] = X8[M][K] . W8[N][K]^T (int32)
 static inline int pf_rb_gemm_i8(rocblas_handle h, const int8_t *W8, int N, int K, const int8_t *X8, int M, int32_t *C) {
     const int32_t alpha = 1, beta = 0;
@@ -158,3 +140,41 @@ static inline int pf_rb_gemm_f32(rocblas_handle h, const float *Wf, int N, int K
     if (st != rocblas_status_success) { fprintf(stderr, "rocblas_sgemm status %d (N=%d K=%d M=%d)\n", (int)st, N, K, M); return -1; }
     return 0;
 }
+
+static int pf_rb_init(PfRb *rb, int T, int nmax) {
+    rb->ok = 0;
+    for (int d = 0; d < 4; d++) {
+        if (hipSetDevice(d) != hipSuccess) return -1;
+        if (rocblas_create_handle(&rb->h[d]) != rocblas_status_success) { fprintf(stderr, "rocblas_create_handle(%d) failed\n", d); return -1; }
+        if (rocblas_set_stream(rb->h[d], 0) != rocblas_status_success) return -1;
+        if (hipMalloc(&rb->C[d], (size_t)T * nmax * 4) != hipSuccess) return -1;
+        if (hipMalloc(&rb->xq2560[d], (size_t)T * 2560) != hipSuccess) return -1;
+        if (hipMalloc(&rb->xq1024[d], (size_t)T * 1024) != hipSuccess) return -1;
+        if (hipMalloc(&rb->xq6144[d], (size_t)T * 6144) != hipSuccess) return -1;
+        if (hipMalloc(&rb->xs2560[d], (size_t)T * 4) != hipSuccess) return -1;
+        if (hipMalloc(&rb->xs1024[d], (size_t)T * 4) != hipSuccess) return -1;
+        if (hipMalloc(&rb->xs6144[d], (size_t)T * 4) != hipSuccess) return -1;
+    }
+    // WARM-UP. rocBLAS loads Tensile code objects lazily on the first call of each shape, about a
+    // second per device across the projection shapes; measured inside the first prompt's prefill
+    // (1K: +1055 ms) before this. Every production shape is run once here, on scratch data.
+    {
+        int8_t *w8 = nullptr; float *wf = nullptr;
+        const struct { int n, k; } i8s[5] = { {1024, 2560}, {9216, 1024}, {2560, 6144}, {128, 2560}, {3072, 1024} };
+        const struct { int n, k; } f32s[3] = { {576, 2560}, {256, 2560}, {24, 2560} };
+        for (int d = 0; d < 4; d++) {
+            if (hipSetDevice(d) != hipSuccess) return -1;
+            if (hipMalloc(&w8, (size_t)2560 * 6144) != hipSuccess) return -1;
+            if (hipMalloc(&wf, (size_t)576 * 2560 * 4) != hipSuccess) return -1;
+            (void)hipMemset(w8, 1, (size_t)2560 * 6144); (void)hipMemset(wf, 0, (size_t)576 * 2560 * 4);
+            (void)hipMemset(rb->xq6144[d], 1, (size_t)T * 6144);
+            for (int i = 0; i < 5; i++) if (pf_rb_gemm_i8(rb->h[d], w8, i8s[i].n, i8s[i].k, rb->xq6144[d], T, rb->C[d])) return -1;
+            for (int i = 0; i < 3; i++) if (pf_rb_gemm_f32(rb->h[d], wf, f32s[i].n, f32s[i].k, (const float *)rb->C[d], T, (float *)rb->C[d] + (size_t)T * 4096)) return -1;
+            if (hipDeviceSynchronize() != hipSuccess) return -1;
+            (void)hipFree(w8); (void)hipFree(wf);
+        }
+    }
+    rb->ok = 1;
+    return 0;
+}
+

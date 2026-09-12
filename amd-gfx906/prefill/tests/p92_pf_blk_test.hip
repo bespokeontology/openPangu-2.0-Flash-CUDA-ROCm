@@ -10,6 +10,7 @@
 #include <cmath>
 #include "../src/p92_pf_attn.hip"
 #include "../src/p92_pf_attn_blk.hip"
+#include "../src/p92_pf_attn_blk2.hip"
 #define CHK(c) do{ hipError_t e=(c); if(e){ printf("HIP %s @%d\n",hipGetErrorString(e),__LINE__); return 1; } }while(0)
 static float b2f(uint16_t b){ uint32_t u=(uint32_t)b<<16; float f; __builtin_memcpy(&f,&u,4); return f; }
 
@@ -117,6 +118,38 @@ int main(){
       CHK(hipDeviceSynchronize()); CHK(hipMemcpy(got2.data(),out2,got2.size()*4,hipMemcpyDeviceToHost));
       pass &= agree("blk vs k_pf_attn_spg2 (selection)",got,got2);
       CHK(hipFree(dlp)); CHK(hipFree(dpp)); }
+
+    // ---- v2 (fp16 tiles, dot2 scores, 48 heads a block): same three modes ----
+    auto agree2=[&](const char*name,const std::vector<float>&a,const std::vector<float>&b)->int{
+        size_t d=0; double w=0;
+        for(size_t i=0;i<a.size();i++){ const double den=fabs(b[i])>1e-3?fabs(b[i]):1e-3; const double rel=fabs(a[i]-b[i])/den; w=fmax(w,rel); if(rel>2e-2) d++; }
+        printf("  %-34s %zu of %zu outputs differ > 2e-2, worst relative %.3e%s\n",name,d,a.size(),w,d?"   <-- FAIL":"");
+        return d==0; };
+    CHK(poison(out));
+    hipLaunchKernelGGL(k_pf_attn_blk2,dim3(T,NH/PFB2_HB),dim3(PFB2_NT),0,0,dq,dqp,dl,dk,dsl,dsp,(const int32_t*)nullptr,(const int32_t*)nullptr,0,CB,T,0,out);
+    CHK(hipDeviceSynchronize()); CHK(hipMemcpy(got.data(),out,got.size()*4,hipMemcpyDeviceToHost));
+    pass &= compare("blk2 full prefix vs host",got,[&](int q){ std::vector<int> k; for(int p=0;p<=CB+q;p++) k.push_back(p); return k; });
+    CHK(poison(out2));
+    hipLaunchKernelGGL((k_pf_attn2<2>),dim3((T+1)/2,NH),dim3(64),0,0,dq,dqp,dl,dk,dsl,dsp,CB,T,0,out2);
+    CHK(hipDeviceSynchronize()); CHK(hipMemcpy(got2.data(),out2,got2.size()*4,hipMemcpyDeviceToHost));
+    pass &= agree2("blk2 vs k_pf_attn2<2> (full prefix)",got,got2);
+    CHK(poison(out));
+    hipLaunchKernelGGL(k_pf_attn_blk2,dim3(T,NH/PFB2_HB),dim3(PFB2_NT),0,0,dq,dqp,dl,dk,dsl,dsp,(const int32_t*)nullptr,(const int32_t*)nullptr,0,CB,T,16,out);
+    CHK(hipDeviceSynchronize()); CHK(hipMemcpy(got.data(),out,got.size()*4,hipMemcpyDeviceToHost));
+    pass &= compare("blk2 window 16 vs host",got,[&](int q){ std::vector<int> k; for(int p=std::max(0,CB+q-15);p<=CB+q;p++) k.push_back(p); return k; });
+    CHK(poison(out));
+    hipLaunchKernelGGL(k_pf_attn_blk2,dim3(T,NH/PFB2_HB),dim3(PFB2_NT),0,0,dq,dqp,dl,dk,dsl,dsp,dsel,dns,WANT,CB,T,0,out);
+    CHK(hipDeviceSynchronize()); CHK(hipMemcpy(got.data(),out,got.size()*4,hipMemcpyDeviceToHost));
+    pass &= compare("blk2 selection vs host",got,[&](int q){ std::vector<int> k; for(int u=0;u<ns[q];u++) k.push_back(sel[(size_t)q*WANT+u]); return k; });
+    { std::vector<float> keep=got; CHK(poison(out));
+      hipLaunchKernelGGL(k_pf_attn_blk2,dim3(T,NH/PFB2_HB),dim3(PFB2_NT),0,0,dq,dqp,dl,dk,dsl,dsp,(const int32_t*)nullptr,(const int32_t*)nullptr,0,CB+1,T,0,out);
+      CHK(hipDeviceSynchronize()); CHK(hipMemcpy(got2.data(),out,got2.size()*4,hipMemcpyDeviceToHost));
+      CHK(poison(out));
+      hipLaunchKernelGGL(k_pf_attn_blk2,dim3(T,NH/PFB2_HB),dim3(PFB2_NT),0,0,dq,dqp,dl,dk,dsl,dsp,(const int32_t*)nullptr,(const int32_t*)nullptr,0,CB,T,0,out);
+      CHK(hipDeviceSynchronize()); CHK(hipMemcpy(got.data(),out,got.size()*4,hipMemcpyDeviceToHost));
+      size_t moved=0; for(size_t i=0;i<got.size();i++) if(got[i]!=got2[i]) moved++;
+      printf("  blk2 negative control (causal edge shifted): %zu of %zu changed%s\n",moved,got.size(),moved?"":"   <-- DETECTOR BLIND");
+      if(!moved) pass=0; }
 
     // ---- negative control: shift the causal edge by one position ----
     { std::vector<float> keep=got;
