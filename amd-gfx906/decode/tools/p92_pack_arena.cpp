@@ -39,6 +39,14 @@ struct ArenaHdr { char magic[8]; uint32_t version, device, layer_begin, layer_en
 
 static int lb(int d){ int b=TRUNK/NGPU, r=TRUNK%NGPU; return d*b+(d<r?d:r); }
 static int le(int d){ int b=TRUNK/NGPU, r=TRUNK%NGPU; return (d+1)*b+((d+1)<r?(d+1):r); }
+// RING OWNERSHIP (optional third argument BLK > 0): card d owns the layer blocks
+// b = d, d+NGPU, d+2*NGPU, ... of BLK layers each, so a chunk hops the ring
+// 0 -> 1 -> 2 -> 3 -> 0 ... and the prefill pipeline fills in (NGPU-1) BLOCK-times
+// instead of (NGPU-1) chunk-times (the short-prompt lever). The arena header
+// records BLK in `pad` (0 = the contiguous 12/12/11/11 layout), so the engine
+// reads its ownership map from the arena it loads rather than from a switch.
+static int g_blk = 0;
+static int owner_of(int L){ return g_blk > 0 ? (L / g_blk) % NGPU : -1; }
 
 static void rd(int fd, void*p, size_t n, off_t o){
     size_t d=0; while(d<n){ ssize_t k=pread(fd,(char*)p+d,n-d,o+d);
@@ -48,8 +56,10 @@ static void wr(int fd, const void*p, size_t n, off_t o){
         if(k<=0){ fprintf(stderr,"pwrite fail %zd\n",k); exit(1);} d+=k; } }
 
 int main(int argc,char**argv){
-    if(argc<3){ printf("usage: %s ARTIFACT_DIR OUT_DIR\n",argv[0]); return 2; }
+    if(argc<3){ printf("usage: %s ARTIFACT_DIR OUT_DIR [RING_BLK]\n",argv[0]); return 2; }
     const std::string A=argv[1], O=argv[2];
+    g_blk = argc>3 ? atoi(argv[3]) : 0;
+    if(g_blk>0) printf("ring ownership: block %d layers, card d owns blocks d, d+%d, ...\n", g_blk, NGPU);
     int mf=open((A+"/manifest.bin").c_str(),O_RDONLY);
     int wf=open((A+"/weights.nvfp4").c_str(),O_RDONLY);
     int sf=open((A+"/scales.e4m3").c_str(),O_RDONLY);
@@ -67,10 +77,12 @@ int main(int argc,char**argv){
     std::vector<uint8_t> wbuf(GU_W), sbuf(GU_S);
     for(int d=0; d<NGPU; d++){
         std::vector<int> ml;
-        for(int L=lb(d); L<le(d); L++) if(L>=2) ml.push_back(L);   // 0,1 are dense
+        if(g_blk>0){ for(int L=2; L<TRUNK; L++) if(owner_of(L)==d) ml.push_back(L); }   // 0,1 are dense
+        else for(int L=lb(d); L<le(d); L++) if(L>=2) ml.push_back(L);
         const size_t n=(size_t)ml.size()*NSLOT;
         ArenaHdr ah{}; memcpy(ah.magic,"P92AREN",8); ah.version=1; ah.device=d;
-        ah.layer_begin=lb(d); ah.layer_end=le(d); ah.moe_layers=(uint32_t)ml.size(); ah.experts=NSLOT;
+        ah.layer_begin=g_blk>0?0:lb(d); ah.layer_end=g_blk>0?TRUNK:le(d); ah.moe_layers=(uint32_t)ml.size(); ah.experts=NSLOT;
+        ah.pad=(uint32_t)g_blk;   // ring block size, 0 = contiguous
         size_t o=(sizeof(ArenaHdr)+4095)&~4095ull;
         ah.off_gw=o; o+=n*GU_W;  ah.off_uw=o; o+=n*GU_W;  ah.off_dw=o; o+=n*DN_W;
         ah.off_gs=o; o+=n*GU_S;  ah.off_us=o; o+=n*GU_S;  ah.off_ds=o; o+=n*DN_S;
@@ -82,7 +94,8 @@ int main(int argc,char**argv){
         wr(of,&ah,sizeof ah,0);
         std::vector<float> s2(n*3);
         printf("device %d: layers %d..%d, %zu MoE layers, arena %.2f GB -> %s\n",
-               d,lb(d),le(d)-1,ml.size(),ah.total/1e9,path);
+               d,(int)ah.layer_begin,(int)ah.layer_end-1,ml.size(),ah.total/1e9,path);
+        if(g_blk>0){ printf("  MoE layers:"); for(int L:ml) printf(" %d",L); printf("\n"); }
         for(size_t li=0; li<ml.size(); li++){
             for(int e=0;e<NSLOT;e++){
                 const size_t slot=li*NSLOT+e;

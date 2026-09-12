@@ -316,6 +316,7 @@ int main(int argc,char**argv){
         CK(hipSetDevice(d));
         char p[512]; snprintf(p,sizeof p,"%s/arena_dev%d.bin",ARENA,d);
         if(p92_arena_load(p,&arena[d])){ printf("arena %d failed\n",d); return 1; }
+        if(arena[d].h.pad!=0){ printf("arena %d is a RING arena (block %u): the bench pipeline is contiguous-only, use p92_serve\n",d,arena[d].h.pad); return 1; }
         // The arena arrives in SPEC order from the decode loader, but
         // k_pf_gateup and k_pf_down read their scales LANE-CONTIGUOUS - the
         // layout k_pf_shuffle_scales_* produces. Nothing shuffled the

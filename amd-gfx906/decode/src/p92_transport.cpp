@@ -36,14 +36,18 @@ int p92_transport_send(P92Transport *t, int from, const void *src) {
     return 0;
 }
 
-int p92_transport_recv(P92Transport *t, int from, void *dst) {
-    if (from < 0 || from >= P92_TX_BOUNDS) return -1;
+int p92_transport_recv_to(P92Transport *t, int from, int to, void *dst) {
+    if (from < 0 || from >= P92_TX_BOUNDS || to < 0 || to >= P92_TX_NGPU || to == from) return -1;
     // the sending device's copy must have landed in host memory first
     TCHK(hipSetDevice(from));
     TCHK(hipStreamSynchronize(t->copy[from]));
-    TCHK(hipSetDevice(from + 1));
-    TCHK(hipMemcpyAsync(dst, t->stage[from], t->bytes, hipMemcpyHostToDevice, t->copy[from + 1]));
+    TCHK(hipSetDevice(to));
+    TCHK(hipMemcpyAsync(dst, t->stage[from], t->bytes, hipMemcpyHostToDevice, t->copy[to]));
     return 0;
+}
+
+int p92_transport_recv(P92Transport *t, int from, void *dst) {
+    return p92_transport_recv_to(t, from, (from + 1) % P92_TX_NGPU, dst);
 }
 
 int p92_transport_wait(P92Transport *t, int device) {

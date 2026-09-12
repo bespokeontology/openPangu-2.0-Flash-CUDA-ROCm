@@ -27,7 +27,8 @@
 #include <cstddef>
 
 #define P92_TX_NGPU     4
-#define P92_TX_BOUNDS   (P92_TX_NGPU - 1)      // 3 crossings a token
+#define P92_TX_BOUNDS   P92_TX_NGPU            // one staging buffer per SENDER: 3 crossings a token
+                                               // on the contiguous 12/12/11/11 map, 11 on the ring map (3 -> 0 included)
 #define P92_TX_STREAMS  4
 #define P92_TX_HIDDEN   2560
 #define P92_TX_BYTES    ((size_t)P92_TX_STREAMS * P92_TX_HIDDEN * 2)   // 20,480
@@ -51,6 +52,8 @@ int  p92_transport_send(P92Transport *t, int from, const void *src);
 // Pull the boundary buffer into device `from + 1`. Async on that device's copy
 // stream. Call p92_transport_wait on the receiving device before using dst.
 int  p92_transport_recv(P92Transport *t, int from, void *dst);
+// The same, into an explicit receiving device (the ring map crosses 3 -> 0).
+int  p92_transport_recv_to(P92Transport *t, int from, int to, void *dst);
 
 int  p92_transport_wait(P92Transport *t, int device);
 

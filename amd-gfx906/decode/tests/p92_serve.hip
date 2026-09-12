@@ -65,6 +65,7 @@ __global__ void k_pf_shuffle_check(const uint8_t*, const uint8_t*, int, int, int
 #include "../../prefill/src/p92_pf_proj.hip"
 #include "../../prefill/src/p92_pf_body.hip"
 #include "../../prefill/src/p92_pf_attn.hip"
+#include "../../prefill/src/p92_pf_attn_blk.hip"
 #include "../../prefill/src/p92_pf_mla.hip"
 #define PF_UMAX (8 * PF_IDX_TOPK)
 #include "../../prefill/src/p92_pf_dsa.hip"
@@ -312,15 +313,25 @@ int main(int argc,char**argv){
     // ---- device ownership: 12/12/11/11 ----------------------------------
     auto lb=[](int d){ int b=NLAYER/4, r=NLAYER%4; return d*b+(d<r?d:r); };
     auto le=[](int d){ int b=NLAYER/4, r=NLAYER%4; return (d+1)*b+((d+1)<r?(d+1):r); };
-    auto owner=[&](int L){ for(int d=0;d<4;d++) if(L>=lb(d)&&L<le(d)) return d; return -1; };
+    // OWNERSHIP COMES FROM THE ARENA. A contiguous arena (header pad = 0) is the 12/12/11/11 map;
+    // a ring arena (pad = block size B) gives card b % 4 the layer block b of B layers, so a
+    // prefill chunk hops the ring 0 -> 1 -> 2 -> 3 -> 0 ... and the pipeline fills in 3 BLOCK-times
+    // instead of 3 chunk-times. Decode crosses cards wherever the owner changes (3 or 11 times).
+    int ring_blk = 0;
+    auto owner=[&](int L){ if (ring_blk > 0) return (L / ring_blk) % 4; for(int d=0;d<4;d++) if(L>=lb(d)&&L<le(d)) return d; return -1; };
 
     P92Arena arena[4];
     for(int d=0;d<4;d++){
         CK(hipSetDevice(d));
         char p[512]; snprintf(p,sizeof p,"%s/arena_dev%d.bin",ARENA,d);
         if(p92_arena_load(p,&arena[d])){ printf("arena %d failed\n",d); return 1; }
-        printf("dev%d layers %d..%d, arena %d slots\n",d,lb(d),le(d)-1,arena[d].slots);
+        if(d==0) ring_blk=(int)arena[0].h.pad;
+        else if((int)arena[d].h.pad!=ring_blk){ printf("arena %d ownership (ring %u) differs from dev0 (ring %d)\n",d,arena[d].h.pad,ring_blk); return 1; }
+        printf("dev%d layers %d..%d, arena %d slots%s\n",d,(int)arena[d].h.layer_begin,(int)arena[d].h.layer_end-1,arena[d].slots,
+               ring_blk>0?" (ring)":"");
     }
+    if(ring_blk>0){ printf("ring ownership, block %d:",ring_blk); for(int L=0;L<NLAYER;L++) if(L%ring_blk==0) printf(" [%d..%d]->dev%d",L,(L+ring_blk<NLAYER?L+ring_blk:NLAYER)-1,owner(L)); printf("\n"); }
+    if(owner(NLAYER-1)!=3){ printf("the last layer must live on dev3 (head placement)\n"); return 1; }
 
     std::vector<LayerW> LW(NLAYER);
     for(int L=0;L<NLAYER;L++){
@@ -369,7 +380,7 @@ int main(int argc,char**argv){
             snprintf(n,sizeof n,"model.layers.%d.mlp.e_score_correction_bias",L);
             auto v=ck.get(n); if(v.empty()){ printf("MISSING %s\n",n); exit(1);}
             w.router_bias=(float*)dev_up(v.data(),v.size());
-            const int li = L - (lb(d)<2?2:lb(d));
+            int li = 0; for (int L2 = 2; L2 < L; L2++) if (owner(L2) == d) li++;   // rank among this card's MoE layers
             w.arena_slot_base = li * arena[d].h.experts;
         }
         if(w.dsa){
@@ -593,16 +604,27 @@ int main(int argc,char**argv){
         arena_layout[d] = want;
     };
 
+    // ---- the block schedule. A block is a contiguous layer range owned by one card; a chunk
+    // visits blocks 0..nblk-1 in order. Contiguous arena: 4 blocks = the cards' ranges. Ring
+    // arena: blocks of ring_blk layers, card b % 4 owns block b.
+    const int nblk = ring_blk > 0 ? (NLAYER + ring_blk - 1) / ring_blk : 4;
+    auto blk_owner = [&](int b) { return ring_blk > 0 ? (b % 4) : b; };
+    auto blk_L0 = [&](int b) { return ring_blk > 0 ? b * ring_blk : lb(b); };
+    auto blk_L1 = [&](int b) { const int e = ring_blk > 0 ? (b + 1) * ring_blk : le(b); return e < NLAYER ? e : NLAYER; };
+    const int PF_NSLOT = 4;
     PfPipeline pipe; memset(&pipe, 0, sizeof pipe);
     size_t land_bytes = (size_t)T * 4 * HID * 2;             // one chunk of four-stream state
     if (use_prefill) {
         if (pf_pipeline_init(&pipe, &cfg, MAXPOS)) { printf("pipeline init failed\n"); return 1; }
-        // TWO landing slots per card (the driver allocates one): the producer may push chunk k+1
-        // while the consumer still owns chunk k's slot.
+        // PF_NSLOT landing slots per card (the driver allocates one): a producer may run ahead of
+        // its consumer by up to PF_NSLOT jobs before it has to wait for a slot to be released.
         p92_p2p_free(&pipe.p2p);
-        if (p92_p2p_init(&pipe.p2p, 2 * land_bytes)) { printf("p2p re-init (2 slots) failed\n"); return 1; }
+        if (p92_p2p_init(&pipe.p2p, (size_t)PF_NSLOT * land_bytes)) { printf("p2p re-init (%d slots) failed\n", PF_NSLOT); return 1; }
     }
     const bool pf_trace = getenv("PF_TRACE") != nullptr;
+    // PF_ATTN_BLK=1: the blocked attention (one query x 24 heads a block, LDS key tiles) on every
+    // layer; the DSA layers then gather straight from the cache and skip the selection pack.
+    const bool pf_blk = getenv("PF_ATTN_BLK") ? atoi(getenv("PF_ATTN_BLK")) != 0 : false;
     const bool pf_ustats = getenv("PF_UNION_STATS") != nullptr;
     std::vector<int> ustat_u, ustat_n; std::mutex ustat_mx;
     const int pf_trace_pos = getenv("PF_TRACE_POS") ? atoi(getenv("PF_TRACE_POS")) : 0;
@@ -610,9 +632,9 @@ int main(int argc,char**argv){
     std::vector<uint16_t> seedbuf((size_t)T * 4 * HID);
 
     // one chunk through the layers this card owns
-    auto pf_layers = [&](int d, int base, int rows_in_chunk) {
+    auto pf_layers = [&](int d, int base, int rows_in_chunk, int L0, int L1) {
         CK(hipSetDevice(d)); Pf &c = pf[d]; PfTimers &tm = pipe.timers[d];
-        for (int L = pipe.layer_begin[d]; L < pipe.layer_end[d]; L++) {
+        for (int L = L0; L < L1; L++) {
             LayerW &w = LW[L];
             // DSA layers see the whole prefix. That is NOT what the model does above
             // 2048 positions - decode runs the indexer and attends to the top-2048 -
@@ -711,7 +733,9 @@ int main(int argc,char**argv){
                                        c.scores,RC,base,PF_IDX_TOPK,MAXPOS,c.sel,c.nsel);
                     pf_stage_end(&tm, PF_S_DSA_SEL, 0);
                     pf_stage_begin(&tm, PF_S_DSA_UNI, 0);
-                    if (cfg.sp_g2) {
+                    if (pf_blk) {
+                        // blocked attention gathers the selection from the cache itself
+                    } else if (cfg.sp_g2) {
                         // G=2 head-shared path: pack each query's selection
                         // directly. No union, no masks, constant strides.
                         hipLaunchKernelGGL(k_pf_sel_pack,dim3(RC),dim3(256),0,0,
@@ -769,6 +793,14 @@ int main(int argc,char**argv){
 
             pf_stage_begin(&tm, PF_S_ATTN, 0);
             const bool sparse_ok = w.dsa && cfg.dsa_sel && (base + RC > PF_IDX_TOPK);
+            if (pf_blk) {
+                hipLaunchKernelGGL(k_pf_attn_blk,dim3(RC,PF_NH/PFB_HB),dim3(PFB_NT),0,0,
+                                   c.qabs,c.qrope,(const uint16_t*)w.cache_kv,(const uint16_t*)w.cache_rope,
+                                   (const uint16_t*)w.sink_kv_n,(const uint16_t*)w.sink_rope,
+                                   sparse_ok ? (const int32_t*)c.sel : (const int32_t*)nullptr,
+                                   sparse_ok ? (const int32_t*)c.nsel : (const int32_t*)nullptr,
+                                   PF_IDX_TOPK, base, RC, sparse_ok ? 0 : win, c.ctx);
+            } else
             if (sparse_ok) {
                 const int TQ = cfg.attn_tq;
                 const int nt = (RC + TQ - 1) / TQ;
@@ -958,7 +990,7 @@ int main(int argc,char**argv){
             }
         }
         if (pipe.sens_stage == 2)
-            for (int L = pipe.layer_begin[d]; L < pipe.layer_end[d]; L++) {
+            for (int L = L0; L < L1; L++) {
                 LayerW &w = LW[L];
                 const int win2 = w.dsa ? cfg.dsa_win : 512;
                 for (int r = 0; r < pipe.sens_reps; r++) {
@@ -985,39 +1017,57 @@ int main(int argc,char**argv){
         if (n <= 0) return 0.0;
         for (int d = 0; d < 4; d++) arena_layout_set(d, 1);
         const int nchunks = (n + T - 1) / T;
-        std::atomic<int> ready[4], consumed[4];
-        for (int d = 0; d < 4; d++) { ready[d].store(-1); consumed[d].store(-1); }
+        // per-card job lists (chunk k, block b) in READINESS order: key = (k + b) * nchunks + k.
+        // A card's producer is always one card (the owner of b-1), and the producer's job order maps
+        // onto the consumer's job order monotonically, so landing slots can be assigned by position.
+        std::vector<std::vector<std::pair<int,int>>> jobs(4);
+        for (int b = 0; b < nblk; b++) for (int k = 0; k < nchunks; k++) jobs[blk_owner(b)].push_back({k, b});
+        for (int g = 0; g < 4; g++) std::sort(jobs[g].begin(), jobs[g].end(),
+            [&](const std::pair<int,int>& a, const std::pair<int,int>& c) {
+                const long ka = (long)(a.first + a.second) * nchunks + a.first, kc = (long)(c.first + c.second) * nchunks + c.first;
+                return ka < kc; });
+        size_t maxjobs = 0; for (int g = 0; g < 4; g++) maxjobs = std::max(maxjobs, jobs[g].size());
+        auto jpos = [&](int g, int k, int b) { const auto& J = jobs[g];
+            for (size_t i = 0; i < J.size(); i++) if (J[i].first == k && J[i].second == b) return (int)i; return -1; };
+        std::vector<std::atomic<int>> done((size_t)4 * maxjobs);   // [g * maxjobs + pos] = 1 once pushed on
+        for (auto& x : done) x.store(0);
+        std::atomic<int> consumed[4];
+        for (int d = 0; d < 4; d++) consumed[d].store(-1);
         auto t0 = std::chrono::steady_clock::now();
         std::vector<std::thread> th;
-        for (int d = 0; d < 4; d++) th.emplace_back([&, d]{
-            CK(hipSetDevice(d));
-            for (int k = 0; k < nchunks; k++) {
+        for (int g = 0; g < 4; g++) th.emplace_back([&, g]{
+            CK(hipSetDevice(g));
+            const auto& J = jobs[g];
+            for (size_t pos = 0; pos < J.size(); pos++) {
+                const int k = J[pos].first, b = J[pos].second;
                 const int base = k * T;
                 const int rows = (base + T <= n) ? T : (n - base);
                 const size_t bytes = (size_t)rows * 4 * HID * 2;
-                if (d == 0) {
+                if (b == 0) {                                     // the prompt: embeddings replicated across the four streams
                     for (int r = 0; r < rows; r++) {
                         const uint16_t *emb = ck.embed_ptr(toks[base + r]);
                         for (int k2 = 0; k2 < 4; k2++) memcpy(&seedbuf[((size_t)r * 4 + k2) * HID], emb, (size_t)HID * 2);
                     }
-                    CK(hipMemcpy(pf[0].state, seedbuf.data(), bytes, hipMemcpyHostToDevice));
-                } else {
-                    while (ready[d-1].load(std::memory_order_acquire) < k) std::this_thread::yield();
-                    CK(hipMemcpy(pf[d].state, (const char*)pipe.p2p.land[d] + (size_t)(k & 1) * land_bytes,
+                    CK(hipMemcpy(pf[g].state, seedbuf.data(), bytes, hipMemcpyHostToDevice));
+                } else {                                          // block b-1's output, pushed into this card's landing slot
+                    const int src = blk_owner(b - 1), spos = jpos(src, k, b - 1);
+                    while (done[(size_t)src * maxjobs + spos].load(std::memory_order_acquire) == 0) std::this_thread::yield();
+                    CK(hipMemcpy(pf[g].state, (const char*)pipe.p2p.land[g] + (size_t)(pos % PF_NSLOT) * land_bytes,
                                  bytes, hipMemcpyDeviceToDevice));
-                    consumed[d].store(k, std::memory_order_release);
+                    consumed[g].store((int)pos, std::memory_order_release);
                 }
-                pf_layers(d, pos0 + base, rows);
-                if (d + 1 < 4) {
-                    while (consumed[d+1].load(std::memory_order_acquire) < k - 2) std::this_thread::yield();
-                    PfTimers &tm = pipe.timers[d];
+                pf_layers(g, pos0 + base, rows, blk_L0(b), blk_L1(b));
+                if (b + 1 < nblk) {
+                    const int dst = blk_owner(b + 1), dpos = jpos(dst, k, b + 1);
+                    while (consumed[dst].load(std::memory_order_acquire) < dpos - PF_NSLOT) std::this_thread::yield();
+                    PfTimers &tm = pipe.timers[g];
                     pf_stage_begin(&tm, PF_S_HANDOFF, 0);
-                    p92_p2p_push(&pipe.p2p, d, d + 1, pf[d].state, (size_t)(k & 1) * land_bytes, bytes, 0, (uint32_t)(k + 1));
-                    CK(hipSetDevice(d)); CK(hipStreamSynchronize(pipe.p2p.push[d]));
+                    p92_p2p_push(&pipe.p2p, g, dst, pf[g].state, (size_t)(dpos % PF_NSLOT) * land_bytes, bytes, 0, (uint32_t)(k + 1));
+                    CK(hipSetDevice(g)); CK(hipStreamSynchronize(pipe.p2p.push[g]));
                     pf_stage_end(&tm, PF_S_HANDOFF, 0);
                     pf_stage_accumulate(&tm);
                 }
-                ready[d].store(k, std::memory_order_release);
+                done[(size_t)g * maxjobs + pos].store(1, std::memory_order_release);
             }
         });
         for (auto &t : th) t.join();
@@ -1268,7 +1318,7 @@ int main(int argc,char**argv){
             if(d!=cur){
                 CK(hipSetDevice(cur)); CK(hipDeviceSynchronize());
                 if(p92_transport_send(&tx,cur,sc[cur].sa)) exit(1);
-                if(p92_transport_recv(&tx,cur,sc[d].sa)) exit(1);
+                if(p92_transport_recv_to(&tx,cur,d,sc[d].sa)) exit(1);
                 if(p92_transport_wait(&tx,d)) exit(1);
                 cur=d;
             }
