@@ -1,7 +1,7 @@
 # OPENPANGU PREFILL — HANDOFF 2026-09-09 night
 
-Tree: `/srv/pangu/p92-prefill` on **amd-host** (4x MI50, gfx906).
-Frozen decode engine `/srv/pangu/p92-amd` — **never modify; copy to /tmp to patch.**
+Tree: `<data>/p92-prefill` on the AMD box (4x MI50, gfx906).
+Frozen decode engine `<data>/p92-amd` — **never modify; copy to /tmp to patch.**
 
 ## 1. WHERE IT IS
 
@@ -17,7 +17,7 @@ Composed native prefill, all 46 layers, 4 cards, WITH the model's sparse DSA.
 
 Dense collapses with prompt length; sparse is near-flat. That is the whole result.
 
-## 2. FREEZES (binaries archived + SHA256 + RECEIPT, in `/srv/pangu/frozen/`)
+## 2. FREEZES (binaries archived + SHA256 + RECEIPT, in `<data>/frozen/`)
 
 `/tmp` is wiped at boot on both boxes. Never freeze there.
 

@@ -48,13 +48,32 @@ derived ratio.
 Absolute peak reference for the AMD cards: HBM streaming measured at
 ~894 GB/s per card in this project's own roofline work.
 
+## 2b. Prefill ingest in the server (v1.2, 2026-09-12)
+
+Whole-engine numbers from `p92_serve` on real prompts (the model's tokenizer over engineering
+documents plus a question), greedy, ring arena (`p92_pack_arena ART OUT 4`), binary defaults
+(blocked attention, deterministic MoE down, device-side decode chain). Source:
+`prefill/24_PREFILL_INGEST_RING_ATTENTION.md` and the frozen receipts.
+
+| prompt tokens | prefill tok/s | time to first generated token | decode after the prompt | notes |
+|---:|---:|---:|---:|---|
+| 1,117 | **989** | 1.15 s | 16.7 ms/token | v1.1 token-walk ingest: 64 tok/s, 18.4 s; contiguous arena with the same kernels: 541-601 |
+| 4,446 | **1,038** | 4.3 s | 20.3 ms/token | old attention kernels on the same arena: 849 |
+| 9,405 | **1,013** | 9.3 s | 19.8 ms/token | old attention kernels: 866 |
+| 38,716 | **964** | 40.2 s | 20.5 ms/token | |
+
+The 710-732 tok/s ladder of v1.1 was a standalone harness whose cards 1-3 computed on
+uninitialised state (defect fixed in v1.2; timing was representative, outputs were not).
+Greedy continuations are identical run to run (the MoE down projection no longer scatters
+with atomics) and identical between the token-walk ingest and the prefill ingest.
+
 ## 3. Memory
 
 | backend | resident | notes |
 |---|---|---|
 | NVIDIA CUDA | 56.9 GB | NVFP4 projections 56,051,047,104 B + auxiliary BF16/F32 |
 | AMD gfx906 | 47 GiB expert arena + ~1.2 GB non-expert per machine | all-NVFP4 expert arena, 257 slots a layer, 12/12/11/11 ownership |
-| AMD gfx906 (prefill) | ~12.8 GiB per card, 4.35 GiB spare | P4 placement; 64K context fits, 128K does not (see `PREFILL_REPORT.md`) |
+| AMD gfx906 (prefill) | ~12.8 GiB per card, 4.35 GiB spare | P4 placement; 64K context fits, 128K does not (see `PREFILL_REPORT.md`); the server adds ~0.2 GiB of prefill scratch a card |
 
 ## 4. What was not measured together
 

@@ -8,7 +8,7 @@ Every number below was recomputed independently from the checkpoint manifest and
 
 ## 1. BYTE TABLE
 
-Trunk only (46 layers). MTP layers 46–48 excluded. INT8 and 4-bit columns follow the **artifact's own quantization rule** — verified by censusing `/srv/pangu/artifact/manifest.bin` (magic `P92FP41`, 36,528 records): quantized families are routed/shared/dense MLP, `q_a_proj`, `q_b_proj`, `o_proj`, `kv_b_proj`, indexer `wq_b`/`wk`, `mlp.gate` (47 records), `lm_head`. Everything else stays BF16 — notably `kv_a_proj_with_mqa`, which has **no manifest record**.
+Trunk only (46 layers). MTP layers 46–48 excluded. INT8 and 4-bit columns follow the **artifact's own quantization rule** — verified by censusing `<data>/artifact/manifest.bin` (magic `P92FP41`, 36,528 records): quantized families are routed/shared/dense MLP, `q_a_proj`, `q_b_proj`, `o_proj`, `kv_b_proj`, indexer `wq_b`/`wk`, `mlp.gate` (47 records), `lm_head`. Everything else stays BF16 — notably `kv_a_proj_with_mqa`, which has **no manifest record**.
 
 4-bit = 9/16 B/element (0.5 B packed + 1 B UE4M3 per 16). INT8 = 1 B + fp32 per-row scale.
 

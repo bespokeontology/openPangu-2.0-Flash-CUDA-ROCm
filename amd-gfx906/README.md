@@ -10,14 +10,17 @@ unchanged as the historical baseline and comparison point.
 
 ## Status
 
-- **Decode: released authority, plain native target decode, MTP OFF.**
-  69.92 tok/s steady, gfx906, 4 cards, 12/12/11/11 layer ownership.
-- **Prefill: released authority (SPG2), 710 / 731 / 732 / 725 / 698 tok/s at
-  4K / 8K / 16K / 32K / 64K prompt tokens.**
-- **MTP: experimental, not part of the released performance claim.**
-  A native three-head draft path and speculative state machine exist on the
-  development branch; the fixed-T batched target verifier is not finished.
-  See `docs/MTP_STATUS.md`.
+- **Prefill ingest in the server (v1.2, 2026-09-12): released authority.** `p92_serve` ingests a
+  prompt with the four-card chunk pipeline and decodes from its caches: real prompts of 1,117 /
+  9,405 / 38,716 tokens at the numbers in `docs/BENCHMARKS.md` §2b (ring arena, binary defaults),
+  time to the first generated token 1.15 s at 1K instead of 18.4 s for the token-walk ingest of
+  v1.1 (989 / 1,038 / 1,013 / 964 tok/s at 1K / 4K / 8K / 32K). Greedy continuations are deterministic run to run and identical between the two ingest paths.
+- **Decode: plain native target decode, MTP OFF.** 69.92 tok/s steady at 512 context on the fixed
+  token stream (v1.1 authority, unchanged kernels); 59-60 tok/s behind a real 1K prompt, 49-50 behind
+  8K-32K (the sparse-attention regime above 2,048 positions).
+- **Prefill bench (v1.1's 710-732 tok/s ladder):** superseded. That harness never delivered chunk
+  state to cards 1-3 (fixed in v1.2; timing was representative, outputs were not).
+- **MTP: experimental, not part of the released performance claim.** See `docs/MTP_STATUS.md`.
 
 ## Hardware and software
 
@@ -66,7 +69,49 @@ cd amd-gfx906/decode
 
 Run: `./p92_gen <checkpoint> <artifact> <arena> <tokens> <maxpos> <start-token>`
 
-## Build (prefill)
+## Build (server with prefill ingest — the product path since 2026-09-12)
+
+`p92_serve` contains the four-card chunked prefill in-process: a prompt is ingested by the
+prefill pipeline and the decoder continues from the same caches (`P92_PREFILL=1`, default;
+`P92_PREFILL_MIN=32` is the shortest prompt that goes through the pipeline). It also needs
+the arena's expert scales in both layouts (flipped in place at the phase boundary), rocBLAS
+for the optional projection path, and pcre2 for the tokenizer.
+
+```
+cd amd-gfx906/decode
+/opt/rocm/bin/hipcc --offload-arch=gfx906 -O3 -std=c++17 -Iinclude -I../prefill/include \
+  tests/p92_serve.hip tools/p92_tokenizer.cpp ../prefill/src/p92_pf_shuffle.hip \
+  ../prefill/src/p92_p2p.hip ../prefill/src/p92_pf_drive.hip -o p92_serve \
+  -lpthread -lpcre2-8 -L/opt/rocm/lib -lrocblas
+```
+
+Run (prompt as int64 token ids from `p92_encode`, `NTOK` = prompt tokens + tokens to generate):
+
+```
+ROCBLAS_TENSILE_LIBPATH=/opt/rocm-5.7.1/lib/rocblas/library P92_TEMP=0 \
+  ~/q27bench ./p92_serve <checkpoint> <artifact> <arena> <NTOK> <MAXPOS> 148899 prompt.i64
+```
+
+Switches (all default to the measured-best setting, see `prefill/24_PREFILL_INGEST_RING_ATTENTION.md`):
+`P92_PREFILL` (1) · `PF_CHUNK` (256) · `PF_ATTN_BLK` (2 = blocked attention v2, 1 = v1, 0 = the
+v1.1 per-head-pair kernels) · `PF_PROJ_RB` (1 = rocBLAS int8 projections, warmed at init) ·
+`PF_DOWN_DET` (1, deterministic MoE down) · `P92_CHAIN` (1, device-side decode crossings) ·
+`PF_VERBOSE=1` prints the prefill's per-stage decomposition.
+
+`ROCBLAS_TENSILE_LIBPATH` pins rocBLAS 5.7.1's library directory: about one run in thirty it
+resolves the path without the `lib/` component and aborts at init.
+
+## Arena layouts: contiguous and ring
+
+`tools/p92_pack_arena.cpp ARTIFACT OUT` packs the contiguous 12/12/11/11 expert arena (the
+decode-optimal map: 3 card crossings a token). `tools/p92_pack_arena.cpp ARTIFACT OUT 4` packs a
+RING arena: card `b % 4` owns the layer block `b` of 4 layers, so a prefill chunk hops the ring
+0 -> 1 -> 2 -> 3 -> 0 ... and the pipeline fills in 3 block-times instead of 3 chunk-times — the
+short-prompt lever (+36-49 % prefill at 1K, +14 % at 4K, +6 % at 8K with the v1.1 kernels; decode
+crosses cards 11 times a token, at no measurable cost with the device-side chain). The arena header records the block size and `p92_serve` reads its ownership
+map from the arena it loads; `p92_pf_bench` is contiguous-only.
+
+## Build (prefill bench)
 
 ```
 cd amd-gfx906/prefill
@@ -75,7 +120,8 @@ cd amd-gfx906/prefill
   src/p92_p2p.hip src/p92_pf_drive.hip -o p92_pf_bench -lpthread
 ```
 
-Run under the machine lock: `~/q27bench ./p92_pf_bench <checkpoint> <artifact> <arena> <prompt> <maxpos>`
+Run under the machine lock: `~/q27bench ./p92_pf_bench <checkpoint> <artifact> <arena> <prompt> <maxpos> [148899 prompt.i64]`
+(argv[7] = a real prompt as int64 ids; without it the bench uses its synthetic token stream).
 
 ## Context
 

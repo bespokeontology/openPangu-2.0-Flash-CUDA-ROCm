@@ -21,13 +21,16 @@ experimental and is not part of the released claim (see amd-gfx906/docs/MTP_STAT
 |---|---|---|---:|---:|---:|---|
 | NVIDIA CUDA | DGX Spark GB10 | MTP / speculative | ON | 52.10 @ 123 ctx, 96 gen ("Explain probability in one clear sentence.") | 51.4 @ 3,807 tokens | preserved baseline |
 | NVIDIA CUDA | DGX Spark GB10 | plain target | OFF | 21.01 @ 331 ctx | 51.4 @ 3,807 tokens | preserved baseline |
-| AMD gfx906 | 4x MI50 / Pro VII | plain target | OFF | 69.92 @ 512 ctx, fixed token stream | 710 / 731 / 732 / 725 / 698 at 4K/8K/16K/32K/64K | current |
+| AMD gfx906 | 4x MI50 / Pro VII | plain target | OFF | 69.92 @ 512 ctx, fixed token stream; 59-60 tok/s behind a real 1K prompt | **prefill ingest in the server**: 989 / 1,038 / 1,013 / 964 tok/s at 1K / 4K / 8K / 32K real prompts (ring arena, binary defaults); time to first token 1.15 s at 1K | current (v1.2) |
 
 The 69.92 tok/s AMD measurement is plain target decode with MTP disabled. The
 52.10 tok/s DGX Spark measurement uses MTP/speculative decoding; the 21.01 tok/s
 DGX Spark measurement is plain target decode.
 
-Full tables, methodology and sources: amd-gfx906/docs/BENCHMARKS.md.
+Full tables, methodology and sources: amd-gfx906/docs/BENCHMARKS.md. The v1.2 AMD prefill
+figures are whole-engine numbers from the server (`p92_serve`: the chunked prefill ingests the
+prompt and the decoder continues from its caches); the earlier 710-732 tok/s ladder was a
+standalone benchmark harness. See `amd-gfx906/prefill/24_PREFILL_INGEST_RING_ATTENTION.md`.
 
 ## Model
 

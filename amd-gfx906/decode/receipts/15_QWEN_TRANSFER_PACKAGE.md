@@ -30,10 +30,10 @@ Bank the other backend's finding as a test case. Confirm or falsify it here.
 
 ## 1. Read these first
 
-On the AMD host these live under `/data/openpangu/p92-amd/receipts/`, and they are
+On the AMD host these live under `<data>/p92-amd/receipts/`, and they are
 published (so link them from your README instead of copying them):
 `amd-gfx906/decode/receipts/` in the openPangu AMD tree on GitHub and Gitee.
-The old `/srv/pangu/p92-amd/receipts/` path in the first version of this file no
+The old `<data>/p92-amd/receipts/` path in the first version of this file no
 longer exists.
 
 The six that matter most:
@@ -376,7 +376,7 @@ left over from an earlier geometry. Fix them when you find them.
 
 ## 6. Pangu code worth copying or adapting
 
-All under `/srv/pangu/p92-amd/src/` on the AMD host.
+All under `<data>/p92-amd/src/` on the AMD host.
 
 | file | what to take | why |
 |---|---|---|
@@ -403,7 +403,7 @@ All under `/srv/pangu/p92-amd/src/` on the AMD host.
     launch overhead 1.245 us; HIP graphs buy only ~15 percent of that
     P2P dead at the driver - three missing kernel config options, see 07_
 
-`ssh <amd-host>`. Do not touch `/srv/pangu/p92-amd` except read-only.
+`ssh <amd-host>`. Do not touch `<data>/p92-amd` except read-only.
 
 ## 8. The two rules that matter most
 
@@ -473,10 +473,10 @@ the product, and not a bit-exact target.** See section 0.
 
 ### 9.4 Pangu
 
-`/srv/pangu/p92-amd` — this port. Section 1 lists the receipts, section 6
+`<data>/p92-amd` — this port. Section 1 lists the receipts, section 6
 the kernels worth copying.
 
-`/srv/pangu/engine/openpangu-flash92-native` — the CUDA oracle for Pangu.
+`<data>/engine/openpangu-flash92-native` — the CUDA oracle for Pangu.
 Its receipts are worth reading even for Qwen, because they record what Huawei
 and the CUDA port measured about MoE/expert execution: grouped-GEMM shapes,
 expert batching, shared-expert fusion, reordering by (projection, expert), and

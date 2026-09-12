@@ -1,7 +1,7 @@
 # Producer-push peer transport: gated, 2026-09-09
 
 Foundation for the four-GPU prefill path. Frozen decode engine untouched.
-Tree: /srv/pangu/p92-prefill. Kernel 6.8.0-138, ROCm 5.7.1-98,
+Tree: <data>/p92-prefill. Kernel 6.8.0-138, ROCm 5.7.1-98,
 four MI50s at profile_peak 1700 MHz. Run under the shared machine lock
 `~/q27bench`, which serialises benchmarks between the two lanes.
 

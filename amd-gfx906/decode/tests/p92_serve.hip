@@ -318,7 +318,7 @@ int main(int argc,char**argv){
     const int prefill_min = getenv("P92_PREFILL_MIN") ? atoi(getenv("P92_PREFILL_MIN")) : 32;
     // PF_PROJ_RB=1: the prefill's dense projections on rocBLAS (int8 per-row mirrors of the NVFP4
     // weights, fp32 sgemm for the bf16 ones) instead of the hand-written row-resident kernels.
-    const bool pf_rb = getenv("PF_PROJ_RB") ? atoi(getenv("PF_PROJ_RB")) != 0 : false;
+    const bool pf_rb = getenv("PF_PROJ_RB") ? atoi(getenv("PF_PROJ_RB")) != 0 : true;    // default on (measured: identical tokens, -27 % proj at 8K, 1006 tok/s at 1K)
     // PF_DOWN_DET=1 (default): deterministic MoE down projection (per-row partials + fixed-order
     // combine) instead of the fp32 atomicAdd scatter, whose run-to-run order flips near-tied tokens.
     const bool pf_det = getenv("PF_DOWN_DET") ? atoi(getenv("PF_DOWN_DET")) != 0 : true;
@@ -328,7 +328,7 @@ int main(int argc,char**argv){
     // PF_ATTN_BLK=1: the blocked attention (one query x 24 heads a block, LDS key tiles) on every
     // layer; the DSA layers then gather straight from the cache and skip the selection pack (and
     // the 584 MB a card of packed streams is not allocated).
-    const int  pf_blk_mode = getenv("PF_ATTN_BLK") ? atoi(getenv("PF_ATTN_BLK")) : 0;   // 1 = v1 (bf16 tiles), 2 = v2 (fp16 tiles, dot2)
+    const int  pf_blk_mode = getenv("PF_ATTN_BLK") ? atoi(getenv("PF_ATTN_BLK")) : 2;   // 2 = v2 (fp16 tiles, dot2; default, measured), 1 = v1 (bf16 tiles), 0 = the per-head-pair kernels
     const bool pf_blk = pf_blk_mode != 0;
 
     Ck ck; if(!ck.open(CKDIR)){ printf("no checkpoint index\n"); return 1; }
