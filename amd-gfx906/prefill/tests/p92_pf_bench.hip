@@ -270,9 +270,30 @@ int main(int argc,char**argv){
     const char*CKDIR = argc>1?argv[1]:"./checkpoint";
     const char*ART   = argc>2?argv[2]:"./artifact";
     const char*ARENA = argc>3?argv[3]:"./arena";
-    const int  NTOK  = argc>4?atoi(argv[4]):8;
+    int        NTOK  = argc>4?atoi(argv[4]):8;
     const int  MAXPOS= argc>5?atoi(argv[5]):512;
     const int  START = argc>6?atoi(argv[6]):148899;
+    // argv[7]: a REAL prompt as int64 token ids (the p92_encode output format, the
+    // same file the chat/serve harnesses take). NTOK becomes the file length; the
+    // synthetic (START+i) stream remains the default so the banked ladder stays
+    // reproducible. Ids are range-checked against the embedding table: an
+    // out-of-vocabulary id would index past the tensor silently (receipt 21).
+    std::vector<int> prompt_ids;
+    if (argc > 7) {
+        int pf = ::open(argv[7], O_RDONLY);
+        if (pf < 0) { printf("no prompt file %s\n", argv[7]); return 1; }
+        struct stat stt; if (fstat(pf, &stt)) { printf("prompt stat failed\n"); return 1; }
+        std::vector<int64_t> pr((size_t)stt.st_size / 8);
+        if (!pr.empty()) rdf(pf, pr.data(), pr.size() * 8, 0);
+        ::close(pf);
+        for (int64_t t : pr) {
+            if (t < 0 || t >= 151552) { printf("prompt id %lld out of vocabulary\n", (long long)t); return 1; }
+            prompt_ids.push_back((int)t);
+        }
+        NTOK = (int)prompt_ids.size();
+        printf("prompt file %s: %d tokens\n", argv[7], NTOK);
+    }
+    if (NTOK > MAXPOS) { printf("prompt %d tokens exceeds MAXPOS %d\n", NTOK, MAXPOS); return 1; }
 
     Ck ck; if(!ck.open(CKDIR)){ printf("no checkpoint index\n"); return 1; }
     mfd=::open((std::string(ART)+"/manifest.bin").c_str(),O_RDONLY);
@@ -521,7 +542,8 @@ int main(int argc,char**argv){
     // uninitialised input measures the machine, not the model.
     if (!ck.embed_open()) { printf("embed_open failed\n"); return 1; }
     std::vector<int> tokens(NTOK);
-    for (int i = 0; i < NTOK; i++) tokens[i] = (START + i) % 151552;
+    if (!prompt_ids.empty()) tokens = prompt_ids;
+    else for (int i = 0; i < NTOK; i++) tokens[i] = (START + i) % 151552;
     std::vector<uint16_t> seedbuf((size_t)T * 4 * HID);
     auto pf_seed = [&](int base, int rows) {
         for (int r = 0; r < rows; r++) {
@@ -546,6 +568,12 @@ int main(int argc,char**argv){
 
     PfPipeline pipe;
     if (pf_pipeline_init(&pipe, &cfg, NTOK)) { printf("pipeline init failed\n"); return 1; }
+    // TWO landing slots a card (the driver allocates one): the producer may push chunk k+1 while
+    // the consumer still owns chunk k's slot. Slot = k & 1; the consumer releases it by copying
+    // the chunk out (consumed[d]), which is the producer's permission to reuse it two chunks on.
+    const size_t land_bytes = (size_t)T * 4 * HID * 2;
+    p92_p2p_free(&pipe.p2p);
+    if (p92_p2p_init(&pipe.p2p, 2 * land_bytes)) { printf("p2p re-init (2 slots) failed\n"); return 1; }
 
     // ---- WALL SENSITIVITY ------------------------------------------------
     // Profiled kernel milliseconds are not recoverable milliseconds. Work that
@@ -965,11 +993,18 @@ int main(int argc,char**argv){
             const int rows = (base + T <= NTOK) ? T : (NTOK - base);
             for (int d = 0; d < 4; d++) {
                 if (d == 0) pf_seed(base, rows);
+                else {
+                    // the pushed chunk sits in THIS card's landing slot: copy it out locally.
+                    // (The frozen bench never did; cards 1-3 ran on uninitialised state.)
+                    CK(hipSetDevice(d));
+                    CK(hipMemcpy(pf[d].state, (const char*)pipe.p2p.land[d] + (size_t)(k & 1) * land_bytes,
+                                 (size_t)rows * 4 * HID * 2, hipMemcpyDeviceToDevice));
+                }
                 pf_layers(d, base, rows);
                 if (d + 1 < 4) {
                     PfTimers &tm = pipe.timers[d];
                     pf_stage_begin(&tm, PF_S_HANDOFF, 0);
-                    p92_p2p_push(&pipe.p2p, d, d + 1, pf[d].state, 0,
+                    p92_p2p_push(&pipe.p2p, d, d + 1, pf[d].state, (size_t)(k & 1) * land_bytes,
                                  (size_t)rows * 4 * HID * 2, 0, (uint32_t)(k + 1));
                     CK(hipSetDevice(d)); CK(hipStreamSynchronize(pipe.p2p.push[d]));
                     pf_stage_end(&tm, PF_S_HANDOFF, 0);
@@ -983,6 +1018,8 @@ int main(int argc,char**argv){
         // finished; card d+1 may start chunk k once ready[d] >= k.
         std::vector<std::thread> th;
         std::atomic<double> ttft_a(0.0);
+        std::atomic<int> consumed[4];
+        for (int d = 0; d < 4; d++) consumed[d].store(-1);
         for (int d = 0; d < 4; d++) th.emplace_back([&, d]{
             for (int k = 0; k < nchunks; k++) {
                 if (d > 0) while (ready[d-1].load(std::memory_order_acquire) < k)
@@ -990,11 +1027,22 @@ int main(int argc,char**argv){
                 const int base = k * T;
                 const int rows = (base + T <= NTOK) ? T : (NTOK - base);
                 if (d == 0) pf_seed(base, rows);
+                else {
+                    // the pushed chunk sits in THIS card's landing slot: copy it out locally and
+                    // release the slot. (The frozen bench never copied; cards 1-3 ran every chunk
+                    // on uninitialised state.)
+                    CK(hipSetDevice(d));
+                    CK(hipMemcpy(pf[d].state, (const char*)pipe.p2p.land[d] + (size_t)(k & 1) * land_bytes,
+                                 (size_t)rows * 4 * HID * 2, hipMemcpyDeviceToDevice));
+                    consumed[d].store(k, std::memory_order_release);
+                }
                 pf_layers(d, base, rows);
                 if (d + 1 < 4) {
+                    while (consumed[d+1].load(std::memory_order_acquire) < k - 2)
+                        std::this_thread::yield();
                     PfTimers &tm = pipe.timers[d];
                     pf_stage_begin(&tm, PF_S_HANDOFF, 0);
-                    p92_p2p_push(&pipe.p2p, d, d + 1, pf[d].state, 0,
+                    p92_p2p_push(&pipe.p2p, d, d + 1, pf[d].state, (size_t)(k & 1) * land_bytes,
                                  (size_t)rows * 4 * HID * 2, 0, (uint32_t)(k + 1));
                     hipSetDevice(d); hipStreamSynchronize(pipe.p2p.push[d]);
                     pf_stage_end(&tm, PF_S_HANDOFF, 0);

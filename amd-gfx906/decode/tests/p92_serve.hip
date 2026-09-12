@@ -45,6 +45,42 @@
 #include <iostream>
 #include "p92/tokenizer.h"
 #include <deque>
+#include <thread>
+#include <atomic>
+#include <mutex>
+// ---- chunked prefill, IN-PROCESS. The prefill engine's kernels and its four-card chunk pipeline
+// are compiled into the server so a prompt is ingested by the chunk pipeline (hundreds of tok/s)
+// instead of being walked one decode step per token (~50-70 tok/s). The caches are the same
+// buffers, at absolute positions; decode continues from them. (receipts 21-23 named this build.)
+#include "p92amd/p92_pf.h"
+#include "p92amd/p92_pf_moe.h"
+#include "p92amd/p92_pf_drive.h"
+#include "p92amd/p92_p2p.h"
+__global__ void k_pf_shuffle_scales_gu(const uint8_t*, uint8_t*, int);
+__global__ void k_pf_shuffle_scales_dn(const uint8_t*, uint8_t*, int);
+__global__ void k_pf_shuffle_check(const uint8_t*, const uint8_t*, int, int, int, uint32_t*);
+#include "../../prefill/src/p92_pf_moe.hip"
+#include "../../prefill/src/p92_pf_down.hip"
+#include "../../prefill/src/p92_pf_quant.hip"
+#include "../../prefill/src/p92_pf_proj.hip"
+#include "../../prefill/src/p92_pf_body.hip"
+#include "../../prefill/src/p92_pf_attn.hip"
+#include "../../prefill/src/p92_pf_mla.hip"
+#define PF_UMAX (8 * PF_IDX_TOPK)
+#include "../../prefill/src/p92_pf_dsa.hip"
+
+// Inverse of k_pf_shuffle_scales_gu/dn: the per-16 expert scales back to the arena's own
+// order, which the decode expert kernels read. per_row 160 / fan 5 for gate,up; 64 / 2 for down.
+__global__ void __launch_bounds__(256)
+k_pe_unshuffle_scales(const uint8_t *__restrict__ src, uint8_t *__restrict__ dst,
+                      int rows_total, int per_row, int fan) {
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (row >= rows_total) return;
+    const int l = threadIdx.x & 31;
+    const uint8_t *s = src + (size_t)row * per_row;
+    uint8_t *d = dst + (size_t)row * per_row;
+    for (int i = 0; i < fan; i++) d[i * 32 + l] = s[l * fan + i];
+}
 
 #define CK(c) do{ hipError_t e=(c); if(e){ printf("HIP %s @%d\n",hipGetErrorString(e),__LINE__); exit(1);} }while(0)
 #define HID 2560
@@ -256,6 +292,11 @@ int main(int argc,char**argv){
     const int  NTOK  = argc>4?atoi(argv[4]):8;
     const int  MAXPOS= argc>5?atoi(argv[5]):512;
     const int  START = argc>6?atoi(argv[6]):148899;
+    // P92_PREFILL=1 (default): a prompt of >= P92_PREFILL_MIN tokens is ingested by the chunked
+    // prefill pipeline and the decoder continues from its caches. 0 = the token-walk ingest (one
+    // decode step per prompt token), kept as the comparison arm.
+    const bool use_prefill = !getenv("P92_PREFILL") || atoi(getenv("P92_PREFILL")) != 0;
+    const int prefill_min = getenv("P92_PREFILL_MIN") ? atoi(getenv("P92_PREFILL_MIN")) : 32;
 
     Ck ck; if(!ck.open(CKDIR)){ printf("no checkpoint index\n"); return 1; }
     mfd=::open((std::string(ART)+"/manifest.bin").c_str(),O_RDONLY);
@@ -351,7 +392,10 @@ int main(int argc,char**argv){
                                tn,w.sink_kv_n+(size_t)s*KVLORA,KVLORA); }
           CK(hipDeviceSynchronize()); hipFree(raw); hipFree(tmp); hipFree(tn); }
         // state
-        w.cap = w.dsa ? MAXPOS : 512;
+        // absolute addressing everywhere under prefill: the chunk kernels write slot = position,
+        // and decode's window on a sliding layer is (win_first + b) % cap = the absolute position
+        // when cap = MAXPOS. Without prefill the sliding layers keep their 512-slot ring.
+        w.cap = (use_prefill || w.dsa) ? MAXPOS : 512;
         CK(hipMalloc(&w.cache_kv,(size_t)w.cap*KVLORA*2));
         CK(hipMalloc(&w.cache_rope,(size_t)w.cap*ROPE*2));
         CK(hipMalloc(&w.mome_q,QLORA*2*2)); CK(hipMemset(w.mome_q,0,QLORA*2*2));
@@ -437,6 +481,557 @@ int main(int argc,char**argv){
     uint32_t *hst,*hhist,*hcnt,*hoff;
     CK(hipMalloc(&hst,4*4)); CK(hipMalloc(&hhist,P92_RBINS*4));
     CK(hipMalloc(&hcnt,2*P92_GMAXC*4)); CK(hipMalloc(&hoff,(2*P92_GMAXC+2)*4));
+
+    // ======================= CHUNKED PREFILL (in-process) =======================
+    PfConfig cfg = pf_config();
+    if (!getenv("PF_CHUNK")) cfg.chunk = 256;                 // the banked production chunk
+    const int T = cfg.chunk;
+    if (use_prefill) printf("prefill: chunk %d, TQ %d, P%d/D4, pipeline depth %d\n", T, cfg.attn_tq, cfg.prefill_cards, cfg.pipe_depth);
+    struct Pf {
+        uint16_t *state, *flat;          // [T][4][HID] bf16, [T][4*HID] bf16
+        float *norm, *mixf, *comb, *logits;
+        int8_t *xq; float *xs;
+        float *qlora, *qnorm, *qup, *kvdn, *curkv, *qabs, *qrope, *ctx, *aout, *hidden;
+        float *rlog; int32_t *rids; float *rwts;
+        PfGroup *groups; int32_t *rows, *order, *ngroups; float *rwt;
+        float *hid9, *hs9; int8_t *hq9;
+        float *cosv, *sinv;
+        uint16_t *state2; float *pre, *post;
+        float *kidx, *qidx, *qidxT, *whd, *scores; int32_t *sel, *nsel;
+        int32_t *uni, *ucnt; uint8_t *umask;
+        uint16_t *lat_pack, *pe_pack; uint8_t *mask_pack; int32_t *packoff;
+        int8_t *xq1024, *xq6144, *dhq; float *xs1024, *xs6144, *dhid, *dhs;
+    } pf[4];
+    const size_t GMAX = (size_t)T * (PF_TOPK + 1);
+    if (use_prefill) for (int d = 0; d < 4; d++) {
+        CK(hipSetDevice(d)); Pf &c = pf[d];
+        auto A = [&](void **p, size_t n) { CK(hipMalloc(p, n)); };
+        A((void**)&c.state,(size_t)T*4*HID*2);   A((void**)&c.flat,(size_t)T*4*HID*2);
+        A((void**)&c.norm,(size_t)T*HID*4);      A((void**)&c.mixf,(size_t)T*HID*4);
+        A((void**)&c.comb,(size_t)T*16*4);       A((void**)&c.logits,(size_t)T*24*4);
+        A((void**)&c.xq,(size_t)T*HID);          A((void**)&c.xs,(size_t)T*(HID/16)*4);
+        A((void**)&c.qlora,(size_t)T*QLORA*4);   A((void**)&c.qnorm,(size_t)T*QLORA*4);
+        A((void**)&c.qup,(size_t)T*QUP*4);       A((void**)&c.kvdn,(size_t)T*KVA*4);
+        A((void**)&c.curkv,(size_t)T*KVLORA*4);
+        A((void**)&c.qabs,(size_t)T*48*KVLORA*4);A((void**)&c.qrope,(size_t)T*48*ROPE*4);
+        A((void**)&c.ctx,(size_t)T*48*KVLORA*4); A((void**)&c.aout,(size_t)T*AOUT*4);
+        A((void**)&c.hidden,(size_t)T*HID*4);
+        A((void**)&c.rlog,(size_t)T*NEXP*4);
+        A((void**)&c.rids,(size_t)T*PF_TOPK*4);  A((void**)&c.rwts,(size_t)T*PF_TOPK*4);
+        A((void**)&c.groups,sizeof(PfGroup)*(PF_GROUP_MAX+1));  // +1 dead slot
+        A((void**)&c.rows,GMAX*4);               A((void**)&c.rwt,GMAX*4);
+        A((void**)&c.order,PF_GROUP_MAX*4);      A((void**)&c.ngroups,4);
+        A((void**)&c.hid9,GMAX*P92_NFF*4);       A((void**)&c.hq9,GMAX*P92_NFF);
+        A((void**)&c.hs9,GMAX*4);
+        A((void**)&c.cosv,(size_t)MAXPOS*32*4);  A((void**)&c.sinv,(size_t)MAXPOS*32*4);
+        A((void**)&c.state2,(size_t)T*4*HID*2);
+        A((void**)&c.pre,(size_t)T*4*4);         A((void**)&c.post,(size_t)T*4*4);
+        A((void**)&c.xq1024,(size_t)T*QLORA);    A((void**)&c.xs1024,(size_t)T*(QLORA/16)*4);
+        A((void**)&c.xq6144,(size_t)T*AOUT);     A((void**)&c.xs6144,(size_t)T*(AOUT/16)*4);
+        A((void**)&c.dhid,(size_t)T*PM_DENSE_FF*4); A((void**)&c.dhq,(size_t)T*PM_DENSE_FF);
+        A((void**)&c.dhs,(size_t)T*(PM_DENSE_FF/16)*4);
+        // DSA selector scratch. scores is the big one: T x MAXPOS floats, 4 MB
+        // at 4096 and 16 MB at 16384. It is materialised because the radix
+        // select makes three passes over it; streaming would mean recomputing
+        // the scores three times, which costs more than storing them once.
+        A((void**)&c.kidx,(size_t)T*PF_IDX_DIM*4);
+        A((void**)&c.qidx,(size_t)T*PF_IDX_HEADS*PF_IDX_DIM*4);
+        A((void**)&c.qidxT,(size_t)T*PF_IDX_HEADS*PF_IDX_DIM*4);
+        A((void**)&c.whd,(size_t)T*PF_IDX_HEADS*4);
+        A((void**)&c.scores,(size_t)T*MAXPOS*4);
+        A((void**)&c.sel,(size_t)T*PF_IDX_TOPK*4);
+        A((void**)&c.nsel,(size_t)T*4);
+        // Union scratch. umax is the worst case TQ*2048; measured mean union is
+        // 3794, so this is roughly 2x over-allocated and costs 2 MB.
+        A((void**)&c.uni,(size_t)((T+1)/2)*PF_UMAX*4);
+        A((void**)&c.umask,(size_t)((T+1)/2)*PF_UMAX);
+        A((void**)&c.ucnt,(size_t)((T+1)/2)*4);
+        // Packed-union streams. Worst case is every query's top-k disjoint:
+        // T*PF_IDX_TOPK slots a layer; a slot is 1024 B lat + 128 B pe + 16 B
+        // mask. 612 MB a card at chunk 256 - the price of turning the scattered
+        // union walk into three sequential streams.
+        A((void**)&c.lat_pack,(size_t)T*PF_IDX_TOPK*KVLORA*2);
+        A((void**)&c.pe_pack,(size_t)T*PF_IDX_TOPK*ROPE*2);
+        A((void**)&c.mask_pack,(size_t)T*PF_IDX_TOPK*16);
+        A((void**)&c.packoff,(size_t)((T+1)/2)*4);
+        // the RoPE table covers every position in the run and is built once
+        hipLaunchKernelGGL(k_pf_rope_table,dim3(MAXPOS),dim3(64),0,0,c.cosv,c.sinv,MAXPOS);
+    }
+
+    // ---- arena scale layout. The prefill expert kernels read the per-16 group scales
+    // LANE-CONTIGUOUS (k_pf_shuffle_scales_*); the decode expert kernels read the arena's own
+    // order. Both kernel families are the frozen authorities, so the layout is flipped IN PLACE at
+    // the phase boundary instead of touching either: ~1.5 GB of scales a card, a few ms each way,
+    // verified as a permutation every time.
+    int arena_layout[4] = {0,0,0,0};   // 0 = decode (arena) order, 1 = prefill (lane-contiguous)
+    auto arena_layout_set = [&](int d, int want) {
+        if (arena_layout[d] == want) return;
+        CK(hipSetDevice(d));
+        const size_t GU = (size_t)arena[d].slots * PF_NFF * (PF_NEMBD/16);
+        const size_t DN = (size_t)arena[d].slots * PF_NEMBD * (PF_NFF/16);
+        const int gurows = arena[d].slots * PF_NFF, dnrows = arena[d].slots * PF_NEMBD;
+        uint8_t *tmp = nullptr; CK(hipMalloc(&tmp, GU > DN ? GU : DN));
+        uint32_t *bad = nullptr; CK(hipMalloc(&bad, 4)); CK(hipMemset(bad, 0, 4));
+        auto flip = [&](uint8_t *buf, int rows, size_t bytes, int per_row, int fan) {
+            if (want) {
+                if (fan == 5) hipLaunchKernelGGL(k_pf_shuffle_scales_gu,dim3((rows+7)/8),dim3(256),0,0,buf,tmp,rows);
+                else          hipLaunchKernelGGL(k_pf_shuffle_scales_dn,dim3((rows+7)/8),dim3(256),0,0,buf,tmp,rows);
+                hipLaunchKernelGGL(k_pf_shuffle_check,dim3((rows+7)/8),dim3(256),0,0,buf,tmp,rows,per_row,fan,bad);
+            } else {
+                hipLaunchKernelGGL(k_pe_unshuffle_scales,dim3((rows+7)/8),dim3(256),0,0,buf,tmp,rows,per_row,fan);
+                hipLaunchKernelGGL(k_pf_shuffle_check,dim3((rows+7)/8),dim3(256),0,0,tmp,buf,rows,per_row,fan,bad);
+            }
+            CK(hipMemcpyAsync(buf,tmp,bytes,hipMemcpyDeviceToDevice,0));
+        };
+        flip(arena[d].gs, gurows, GU, PF_NEMBD/16, 5);
+        flip(arena[d].us, gurows, GU, PF_NEMBD/16, 5);
+        flip(arena[d].ds, dnrows, DN, PF_NFF/16, 2);
+        CK(hipDeviceSynchronize());
+        uint32_t nbad = 0; CK(hipMemcpy(&nbad,bad,4,hipMemcpyDeviceToHost));
+        if (nbad) { printf("arena %d scale layout switch is not a permutation: %u\n",d,nbad); exit(1); }
+        CK(hipFree(tmp)); CK(hipFree(bad));
+        arena_layout[d] = want;
+    };
+
+    PfPipeline pipe; memset(&pipe, 0, sizeof pipe);
+    size_t land_bytes = (size_t)T * 4 * HID * 2;             // one chunk of four-stream state
+    if (use_prefill) {
+        if (pf_pipeline_init(&pipe, &cfg, MAXPOS)) { printf("pipeline init failed\n"); return 1; }
+        // TWO landing slots per card (the driver allocates one): the producer may push chunk k+1
+        // while the consumer still owns chunk k's slot.
+        p92_p2p_free(&pipe.p2p);
+        if (p92_p2p_init(&pipe.p2p, 2 * land_bytes)) { printf("p2p re-init (2 slots) failed\n"); return 1; }
+    }
+    const bool pf_trace = getenv("PF_TRACE") != nullptr;
+    const bool pf_ustats = getenv("PF_UNION_STATS") != nullptr;
+    std::vector<int> ustat_u, ustat_n; std::mutex ustat_mx;
+    const int pf_trace_pos = getenv("PF_TRACE_POS") ? atoi(getenv("PF_TRACE_POS")) : 0;
+    std::atomic<long> sens_fired(0);
+    std::vector<uint16_t> seedbuf((size_t)T * 4 * HID);
+
+    // one chunk through the layers this card owns
+    auto pf_layers = [&](int d, int base, int rows_in_chunk) {
+        CK(hipSetDevice(d)); Pf &c = pf[d]; PfTimers &tm = pipe.timers[d];
+        for (int L = pipe.layer_begin[d]; L < pipe.layer_end[d]; L++) {
+            LayerW &w = LW[L];
+            // DSA layers see the whole prefix. That is NOT what the model does above
+            // 2048 positions - decode runs the indexer and attends to the top-2048 -
+            // but prefill launches no indexer, so this diverges from the reference
+            // engine on any prompt longer than 2048 and does work the model does not
+            // ask for. PF_DSA_WIN bounds it with a trailing window purely to measure
+            // the ceiling; a window is not a selection and is not a correctness fix.
+            const int win = w.dsa ? cfg.dsa_win : 512;
+            const int RC = rows_in_chunk;
+
+            // ---- attention mHC: logits, hoisted RMS scale, gates, Sinkhorn, collapse
+            pf_stage_begin(&tm, PF_S_MHC, 0);
+            hipLaunchKernelGGL(k_pf_mhc_logits,dim3(24,RC),dim3(256),0,0,
+                               c.state,(const uint16_t*)w.aphi,(const uint16_t*)w.agam,RC,c.logits);
+            hipLaunchKernelGGL(k_pf_mhc_scale,dim3(RC),dim3(256),0,0,
+                               c.state,(const uint16_t*)w.agam,RC,c.logits);
+            hipLaunchKernelGGL(k_pf_mhc_prepost,dim3(RC),dim3(64),0,0,
+                               c.logits,(const uint16_t*)w.aalp,(const uint16_t*)w.abet,RC,c.pre,c.post);
+            hipLaunchKernelGGL(k_pf_mhc_collapse,dim3(RC),dim3(64),0,0,
+                               c.logits,(const uint16_t*)w.aalp,(const uint16_t*)w.abet,RC,c.comb);
+            hipLaunchKernelGGL(k_pf_mhc_mix,dim3((HID+255)/256,RC),dim3(256),0,0,
+                               c.state,c.pre,RC,c.mixf);
+            pf_stage_end(&tm, PF_S_MHC, 0);
+
+            pf_stage_begin(&tm, PF_S_NORM, 0);
+            hipLaunchKernelGGL((k_pf_rmsnorm_k<HID>),dim3(RC),dim3(256),0,0,
+                               c.mixf,(const uint16_t*)w.in_norm,c.norm,RC,1e-5f);
+            hipLaunchKernelGGL((k_pf_quant_k<HID>),dim3(RC),dim3(256),0,0,c.norm,RC,c.xq,c.xs);
+            pf_stage_end(&tm, PF_S_NORM, 0);
+
+            // ---- query path: q_a, MoME, q_norm, q_b
+            pf_stage_begin(&tm, PF_S_PROJ, 0);
+            hipLaunchKernelGGL((k_pf_proj<HID>),dim3((QLORA+7)/8),dim3(256),0,0,
+                               w.qa.w,w.qa.s,c.xq,c.xs,w.qa.s2,RC,QLORA,c.qlora);
+            hipLaunchKernelGGL(k_pf_mome_st,dim3((QLORA+255)/256),dim3(256),0,0,
+                               c.qlora,(const uint16_t*)w.qa_conv,w.mome_q,RC,QLORA,QLORA);
+            hipLaunchKernelGGL((k_pf_rmsnorm_k<QLORA>),dim3(RC),dim3(256),0,0,
+                               c.qlora,(const uint16_t*)w.q_norm,c.qnorm,RC,1e-5f);
+            hipLaunchKernelGGL((k_pf_quant_k<QLORA>),dim3(RC),dim3(256),0,0,
+                               c.qnorm,RC,c.xq1024,c.xs1024);
+            hipLaunchKernelGGL((k_pf_proj<QLORA>),dim3((QUP+7)/8),dim3(256),0,0,
+                               w.qb.w,w.qb.s,c.xq1024,c.xs1024,w.qb.s2,RC,QUP,c.qup);
+            // ---- key/value path: kv_a, MoME, kv_norm, publish into the cache
+            hipLaunchKernelGGL((k_pf_bf16_gemv_rows<HID>),dim3((KVA+3)/4,RC),dim3(256),0,0,
+                               (const uint16_t*)w.kv_a,c.norm,RC,KVA,c.kvdn);
+            hipLaunchKernelGGL(k_pf_mome_st,dim3((KVLORA+255)/256),dim3(256),0,0,
+                               c.kvdn,(const uint16_t*)w.kv_conv,w.mome_kv,RC,KVLORA,KVA);
+            hipLaunchKernelGGL(k_pf_kv_cache,dim3(RC),dim3(256),0,0,
+                               c.kvdn,(const uint16_t*)w.kv_norm,c.cosv,c.sinv,RC,base,KVA,
+                               w.cache_kv,w.cache_rope);
+            hipLaunchKernelGGL(k_pf_absorb,dim3(48,2,RC),dim3(256),0,0,
+                               c.qup,(const uint16_t*)w.kv_b,RC,c.qabs);
+            pf_stage_end(&tm, PF_S_PROJ, 0);
+
+            // ---- DSA: indexer key always, selection only above the threshold
+            // The key cache must be written at EVERY position on a DSA layer,
+            // not only when selection runs. Decode carries a scar comment about
+            // exactly this: gating the cache write on the threshold left rows
+            // 0..2047 unwritten, and the selector then scored raw hipMalloc
+            // contents - silently, because equal scores make the tie band
+            // swallow the array and the ascending gather returns the OLDEST
+            // 2048 positions.
+            if (w.dsa) {
+                pf_stage_begin(&tm, PF_S_DSA, 0);
+                hipLaunchKernelGGL((k_pf_proj<HID>),dim3((PF_IDX_DIM+7)/8),dim3(256),0,0,
+                                   w.ix_wk.w,w.ix_wk.s,c.xq,c.xs,w.ix_wk.s2,RC,PF_IDX_DIM,c.kidx);
+                hipLaunchKernelGGL(k_pf_ix_key,dim3(RC),dim3(PF_IDX_DIM),0,0,
+                                   c.kidx,(const uint16_t*)w.ix_knorm,c.cosv,c.sinv,
+                                   RC,base,w.cap,1e-5f,w.ix_cache);
+                pf_stage_end(&tm, PF_S_DSA, 0);
+                if (cfg.dsa_sel && base + RC > PF_IDX_TOPK) {
+                    pf_stage_begin(&tm, PF_S_DSA_SCORE, 0);
+                    hipLaunchKernelGGL((k_pf_proj<QLORA>),dim3((PF_IDX_HEADS*PF_IDX_DIM+7)/8),dim3(256),0,0,
+                                       w.ix_wqb.w,w.ix_wqb.s,c.xq1024,c.xs1024,w.ix_wqb.s2,
+                                       RC,PF_IDX_HEADS*PF_IDX_DIM,c.qidx);
+                    if (cfg.dsa_scorer == 3)
+                        hipLaunchKernelGGL(k_pf_ix_query_t,dim3(PF_IDX_HEADS,RC),dim3(64),0,0,
+                                           c.qidx,c.qidxT,c.cosv,c.sinv,RC,base);
+                    else
+                        hipLaunchKernelGGL(k_pf_ix_query,dim3(PF_IDX_HEADS,RC),dim3(32),0,0,
+                                           c.qidx,c.cosv,c.sinv,RC,base);
+                    hipLaunchKernelGGL((k_pf_bf16_gemv_rows<HID>),dim3((PF_IDX_HEADS+3)/4,RC),dim3(256),0,0,
+                                       (const uint16_t*)w.ix_wproj,c.norm,RC,PF_IDX_HEADS,c.whd);
+                    const int maxn = base + RC;
+                    if (cfg.dsa_scorer == 3)
+                        hipLaunchKernelGGL(k_pf_idx_scores3,dim3((maxn+255)/256,RC),dim3(256),0,0,
+                                           c.qidxT,(const uint16_t*)w.ix_cache,c.whd,w.cap,RC,base,
+                                           1.0f/sqrtf((float)PF_IDX_DIM),c.scores,MAXPOS);
+                    else
+                        hipLaunchKernelGGL(k_pf_idx_scores,dim3((maxn+255)/256,RC),dim3(256),0,0,
+                                           c.qidx,(const uint16_t*)w.ix_cache,c.whd,w.cap,RC,base,
+                                           1.0f/sqrtf((float)PF_IDX_DIM),c.scores,MAXPOS);
+                    pf_stage_end(&tm, PF_S_DSA_SCORE, 0);
+                    pf_stage_begin(&tm, PF_S_DSA_SEL, 0);
+                    hipLaunchKernelGGL(k_pf_idx_select,dim3(RC),dim3(PF_SEL_THREADS),0,0,
+                                       c.scores,RC,base,PF_IDX_TOPK,MAXPOS,c.sel,c.nsel);
+                    pf_stage_end(&tm, PF_S_DSA_SEL, 0);
+                    pf_stage_begin(&tm, PF_S_DSA_UNI, 0);
+                    if (cfg.sp_g2) {
+                        // G=2 head-shared path: pack each query's selection
+                        // directly. No union, no masks, constant strides.
+                        hipLaunchKernelGGL(k_pf_sel_pack,dim3(RC),dim3(256),0,0,
+                                           c.sel,c.nsel,RC,PF_IDX_TOPK,
+                                           (const uint16_t*)w.cache_kv,
+                                           (const uint16_t*)w.cache_rope,
+                                           c.lat_pack,c.pe_pack);
+                    } else {
+                    // one shared key set per TQ=4 tile, each query masked to
+                    // its own top-2048 within it
+                    { const int TQ = cfg.attn_tq;
+                      const int nt = (RC + TQ - 1) / TQ;
+                      if (TQ == 8)
+                        hipLaunchKernelGGL((k_pf_union<8>),dim3(nt),dim3(256),
+                                           (size_t)(base+RC),0,c.sel,c.nsel,RC,PF_IDX_TOPK,
+                                           base+RC,c.uni,c.umask,c.ucnt,PF_UMAX);
+                      else if (TQ == 2)
+                        hipLaunchKernelGGL((k_pf_union<2>),dim3(nt),dim3(256),
+                                           (size_t)(base+RC),0,c.sel,c.nsel,RC,PF_IDX_TOPK,
+                                           base+RC,c.uni,c.umask,c.ucnt,PF_UMAX);
+                      else
+                        hipLaunchKernelGGL((k_pf_union<4>),dim3(nt),dim3(256),
+                                           (size_t)(base+RC),0,c.sel,c.nsel,RC,PF_IDX_TOPK,
+                                           base+RC,c.uni,c.umask,c.ucnt,PF_UMAX);
+                      if (cfg.sp_pack) {
+                          // consumer-designed emission: ordered union keys ->
+                          // contiguous per-tile streams, so the sweep needs no
+                          // index chain at all
+                          hipLaunchKernelGGL(k_pf_pack_scan,dim3(1),dim3(256),0,0,
+                                             c.ucnt,nt,c.packoff);
+                          hipLaunchKernelGGL(k_pf_union_pack,dim3(nt),dim3(256),0,0,
+                                             c.uni,c.umask,c.ucnt,c.packoff,PF_UMAX,
+                                             (const uint16_t*)w.cache_kv,
+                                             (const uint16_t*)w.cache_rope,
+                                             c.lat_pack,c.pe_pack,c.mask_pack);
+                      } } }
+                    pf_stage_end(&tm, PF_S_DSA_UNI, 0);
+                    if (pf_ustats && d == 0) {
+                        CK(hipDeviceSynchronize());
+                        const int nt = (RC + 3) / 4;
+                        std::vector<int> u(nt), ns(RC);
+                        CK(hipMemcpy(u.data(), c.ucnt, (size_t)nt*4, hipMemcpyDeviceToHost));
+                        CK(hipMemcpy(ns.data(), c.nsel, (size_t)RC*4, hipMemcpyDeviceToHost));
+                        std::lock_guard<std::mutex> lk(ustat_mx);
+                        ustat_u.insert(ustat_u.end(), u.begin(), u.end());
+                        ustat_n.insert(ustat_n.end(), ns.begin(), ns.end());
+                    }
+                }
+            }
+
+            pf_stage_begin(&tm, PF_S_ROPE, 0);
+            hipLaunchKernelGGL(k_pf_qrope,dim3(48,RC),dim3(32),0,0,
+                               c.qup,c.cosv,c.sinv,RC,base,c.qrope);
+            pf_stage_end(&tm, PF_S_ROPE, 0);
+
+            pf_stage_begin(&tm, PF_S_ATTN, 0);
+            const bool sparse_ok = w.dsa && cfg.dsa_sel && (base + RC > PF_IDX_TOPK);
+            if (sparse_ok) {
+                const int TQ = cfg.attn_tq;
+                const int nt = (RC + TQ - 1) / TQ;
+                if (cfg.sp_g2) {
+                    hipLaunchKernelGGL(k_pf_attn_spg2,dim3(RC,24),dim3(64),0,0,
+                                       c.qabs,c.qrope,c.lat_pack,c.pe_pack,
+                                       (const uint16_t*)w.sink_kv_n,(const uint16_t*)w.sink_rope,
+                                       c.nsel,PF_IDX_TOPK,RC,c.ctx);
+                } else if (cfg.sp_pack) {
+                    if (TQ == 8)
+                        hipLaunchKernelGGL((k_pf_attn_spk<8>),dim3(nt,48),dim3(64),0,0,
+                                           c.qabs,c.qrope,c.lat_pack,c.pe_pack,c.mask_pack,
+                                           (const uint16_t*)w.sink_kv_n,(const uint16_t*)w.sink_rope,
+                                           c.ucnt,c.packoff,RC,c.ctx);
+                    else if (TQ == 2)
+                        hipLaunchKernelGGL((k_pf_attn_spk<2>),dim3(nt,48),dim3(64),0,0,
+                                           c.qabs,c.qrope,c.lat_pack,c.pe_pack,c.mask_pack,
+                                           (const uint16_t*)w.sink_kv_n,(const uint16_t*)w.sink_rope,
+                                           c.ucnt,c.packoff,RC,c.ctx);
+                    else
+                        hipLaunchKernelGGL((k_pf_attn_spk<4>),dim3(nt,48),dim3(64),0,0,
+                                           c.qabs,c.qrope,c.lat_pack,c.pe_pack,c.mask_pack,
+                                           (const uint16_t*)w.sink_kv_n,(const uint16_t*)w.sink_rope,
+                                           c.ucnt,c.packoff,RC,c.ctx);
+                } else if (TQ == 8)
+                    hipLaunchKernelGGL((k_pf_attn_sp<8>),dim3(nt,48),dim3(64),0,0,
+                                       c.qabs,c.qrope,(const uint16_t*)w.cache_kv,
+                                       (const uint16_t*)w.cache_rope,
+                                       (const uint16_t*)w.sink_kv_n,(const uint16_t*)w.sink_rope,
+                                       c.uni,c.umask,c.ucnt,PF_UMAX,RC,c.ctx);
+                else if (TQ == 2)
+                    hipLaunchKernelGGL((k_pf_attn_sp<2>),dim3(nt,48),dim3(64),0,0,
+                                       c.qabs,c.qrope,(const uint16_t*)w.cache_kv,
+                                       (const uint16_t*)w.cache_rope,
+                                       (const uint16_t*)w.sink_kv_n,(const uint16_t*)w.sink_rope,
+                                       c.uni,c.umask,c.ucnt,PF_UMAX,RC,c.ctx);
+                else
+                    hipLaunchKernelGGL((k_pf_attn_sp<4>),dim3(nt,48),dim3(64),0,0,
+                                       c.qabs,c.qrope,(const uint16_t*)w.cache_kv,
+                                       (const uint16_t*)w.cache_rope,
+                                       (const uint16_t*)w.sink_kv_n,(const uint16_t*)w.sink_rope,
+                                       c.uni,c.umask,c.ucnt,PF_UMAX,RC,c.ctx);
+            }
+            else
+            pf_attn_launch(cfg.attn_kernel,cfg.attn_tq,c.qabs,c.qrope,
+                           (const uint16_t*)w.cache_kv,(const uint16_t*)w.cache_rope,
+                           (const uint16_t*)w.sink_kv_n,(const uint16_t*)w.sink_rope,
+                           base,RC,win,c.ctx,0);
+            if (pipe.sens_stage == 1)
+                for (int r = 0; r < pipe.sens_reps; r++) {
+                    pf_attn_launch(cfg.attn_kernel,cfg.attn_tq,c.qabs,c.qrope,
+                                   (const uint16_t*)w.cache_kv,(const uint16_t*)w.cache_rope,
+                                   (const uint16_t*)w.sink_kv_n,(const uint16_t*)w.sink_rope,
+                                   base,RC,win,c.ctx,0);
+                    sens_fired.fetch_add(1, std::memory_order_relaxed);
+                }
+            hipLaunchKernelGGL(k_pf_value_up,dim3((48*128+3)/4,RC),dim3(256),0,0,
+                               c.ctx,(const uint16_t*)w.kv_b,RC,c.aout);
+            hipLaunchKernelGGL(k_pf_mome_st,dim3((AOUT+255)/256),dim3(256),0,0,
+                               c.aout,(const uint16_t*)w.o_conv,w.mome_o,RC,AOUT,AOUT);
+            hipLaunchKernelGGL((k_pf_quant_k<AOUT>),dim3(RC),dim3(256),0,0,
+                               c.aout,RC,c.xq6144,c.xs6144);
+            hipLaunchKernelGGL((k_pf_proj<AOUT>),dim3((HID+7)/8),dim3(256),0,0,
+                               w.o.w,w.o.s,c.xq6144,c.xs6144,w.o.s2,RC,HID,c.hidden);
+            pf_stage_end(&tm, PF_S_ATTN, 0);
+            if (pf_trace && L == 0 && pf_trace_pos >= base && pf_trace_pos < base + RC) {
+                CK(hipDeviceSynchronize());
+                auto rms = [&](const float *p, int n) { std::vector<float> h(n);
+                    CK(hipMemcpy(h.data(), p, (size_t)n*4, hipMemcpyDeviceToHost));
+                    double s2 = 0; for (float v : h) s2 += (double)v * v;
+                    return sqrt(s2/(double)n); };
+                printf("  DBG L0 qlora %.6g qnorm %.6g qup %.6g kvdn %.6g ctx %.6g aout %.6g attnout %.6g\n",
+                       rms(c.qlora,QLORA),rms(c.qnorm,QLORA),rms(c.qup,QUP),rms(c.kvdn,KVA),
+                       rms(c.ctx,48*512),rms(c.aout,AOUT),rms(c.hidden,HID));
+            }
+
+            // ---- attention mHC post: re-expand across the four streams -> state2
+            pf_stage_begin(&tm, PF_S_MHC, 0);
+            hipLaunchKernelGGL((k_pf_rmsnorm_k<HID>),dim3(RC),dim3(256),0,0,
+                               c.hidden,(const uint16_t*)w.post_attn,c.norm,RC,1e-5f);
+            hipLaunchKernelGGL(k_pf_reexpand,dim3((HID+255)/256,RC),dim3(256),0,0,
+                               c.post,c.comb,c.norm,c.state,RC,c.state2);
+            // ---- MLP mHC pre, on state2
+            hipLaunchKernelGGL(k_pf_mhc_logits,dim3(24,RC),dim3(256),0,0,
+                               c.state2,(const uint16_t*)w.mphi,(const uint16_t*)w.mgam,RC,c.logits);
+            hipLaunchKernelGGL(k_pf_mhc_scale,dim3(RC),dim3(256),0,0,
+                               c.state2,(const uint16_t*)w.mgam,RC,c.logits);
+            hipLaunchKernelGGL(k_pf_mhc_prepost,dim3(RC),dim3(64),0,0,
+                               c.logits,(const uint16_t*)w.malp,(const uint16_t*)w.mbet,RC,c.pre,c.post);
+            hipLaunchKernelGGL(k_pf_mhc_collapse,dim3(RC),dim3(64),0,0,
+                               c.logits,(const uint16_t*)w.malp,(const uint16_t*)w.mbet,RC,c.comb);
+            hipLaunchKernelGGL(k_pf_mhc_mix,dim3((HID+255)/256,RC),dim3(256),0,0,
+                               c.state2,c.pre,RC,c.mixf);
+            pf_stage_end(&tm, PF_S_MHC, 0);
+
+            pf_stage_begin(&tm, PF_S_NORM, 0);
+            hipLaunchKernelGGL((k_pf_rmsnorm_k<HID>),dim3(RC),dim3(256),0,0,
+                               c.mixf,(const uint16_t*)w.pre_mlp,c.norm,RC,1e-5f);
+            hipLaunchKernelGGL((k_pf_quant_k<HID>),dim3(RC),dim3(256),0,0,c.norm,RC,c.xq,c.xs);
+            pf_stage_end(&tm, PF_S_NORM, 0);
+
+            if (w.dense) {
+                pf_stage_begin(&tm, PF_S_GATEUP, 0);
+                hipLaunchKernelGGL(k_pf_dense_gateup,dim3(PM_DENSE_FF/8),dim3(256),0,0,
+                                   w.dg.w,w.dg.s,w.du.w,w.du.s,c.xq,c.xs,
+                                   w.dg.s2,w.du.s2,RC,c.dhid);
+                pf_stage_end(&tm, PF_S_GATEUP, 0);
+                pf_stage_begin(&tm, PF_S_REQUANT, 0);
+                hipLaunchKernelGGL((k_pf_quant_k<PM_DENSE_FF>),dim3(RC),dim3(256),0,0,
+                                   c.dhid,RC,c.dhq,c.dhs);
+                pf_stage_end(&tm, PF_S_REQUANT, 0);
+                pf_stage_begin(&tm, PF_S_DOWN, 0);
+                hipLaunchKernelGGL((k_pf_proj<PM_DENSE_FF>),dim3((HID+7)/8),dim3(256),0,0,
+                                   w.dd.w,w.dd.s,c.dhq,c.dhs,w.dd.s2,RC,HID,c.hidden);
+                pf_stage_end(&tm, PF_S_DOWN, 0);
+            } else {
+                pf_stage_begin(&tm, PF_S_ROUTE, 0);
+                hipLaunchKernelGGL(k_pf_route_gemv,dim3(NEXP/4,RC),dim3(256),0,0,
+                                   (const uint16_t*)w.router_w,c.norm,RC,c.rlog);
+                hipLaunchKernelGGL(k_pf_router,dim3(RC),dim3(64),0,0,
+                                   c.rlog,w.router_bias,RC,c.rids,c.rwts);
+                if (pf_trace && base==0 && (L==2||L==4||L==6)) {
+                    CK(hipDeviceSynchronize());
+                    int ids[8]; float wt[8];
+                    CK(hipMemcpy(ids,c.rids,32,hipMemcpyDeviceToHost));
+                    CK(hipMemcpy(wt,c.rwts,32,hipMemcpyDeviceToHost));
+                    printf("  RT L%d ids",L); for(int q=0;q<8;q++) printf(" %d",ids[q]);
+                    printf(" wts"); for(int q=0;q<8;q++) printf(" %.4f",wt[q]); printf("\n");
+                }
+                hipLaunchKernelGGL(k_pf_group,dim3(1),dim3(256),0,0,
+                                   c.rids,c.rwts,RC,w.arena_slot_base,NEXP,
+                                   c.groups,c.rows,c.rwt,c.order,c.ngroups);
+                pf_stage_end(&tm, PF_S_ROUTE, 0);
+                // FIXED PF_GROUP_MAX GRID (09-09). The blocking D2H read of the
+                // live-group count drained the queue and re-synced the host
+                // every MoE layer (~2816 forced syncs a card at 64K) - the
+                // drained-post-barrier launch measured at 10.8 us against
+                // 1.25 us nominal. Dead grid slots read the pinned nrows==0
+                // group and return, so the grids size themselves out of the
+                // group table with no host round-trip.
+                pf_stage_begin(&tm, PF_S_GATEUP, 0);
+                hipLaunchKernelGGL(k_pf_gateup,dim3(P92_NFF/8,PF_GROUP_MAX),dim3(256),0,0,
+                                   arena[d].gw,arena[d].gs,arena[d].uw,arena[d].us,
+                                   c.xq,c.xs,arena[d].s2,c.groups,c.order,c.rows,c.hid9);
+                pf_stage_end(&tm, PF_S_GATEUP, 0);
+                pf_stage_begin(&tm, PF_S_REQUANT, 0);
+                hipLaunchKernelGGL(k_pf_requant,dim3((int)GMAX),dim3(256),0,0,
+                                   c.hid9,(int)GMAX,c.hq9,c.hs9);
+                pf_stage_end(&tm, PF_S_REQUANT, 0);
+                pf_stage_begin(&tm, PF_S_DOWN, 0);
+                // k_pf_down scatters with atomicAdd, so the destination must
+                // start at zero every layer. It never did.
+                CK(hipMemsetAsync(c.hidden,0,(size_t)RC*HID*4,0));
+                hipLaunchKernelGGL(k_pf_down,dim3(HID/8,PF_GROUP_MAX),dim3(256),0,0,
+                                   arena[d].dw,arena[d].ds,c.hq9,c.hs9,arena[d].s2,
+                                   c.groups,c.order,c.rows,c.rwt,c.hidden);
+                pf_stage_end(&tm, PF_S_DOWN, 0);
+            }
+
+            // ---- MLP mHC post -> state
+            pf_stage_begin(&tm, PF_S_MHC, 0);
+            hipLaunchKernelGGL((k_pf_rmsnorm_k<HID>),dim3(RC),dim3(256),0,0,
+                               c.hidden,(const uint16_t*)w.post_mlp,c.norm,RC,1e-5f);
+            hipLaunchKernelGGL(k_pf_reexpand,dim3((HID+255)/256,RC),dim3(256),0,0,
+                               c.post,c.comb,c.norm,c.state2,RC,c.state);
+            if (w.block_post)
+                hipLaunchKernelGGL(k_pf_block_post,dim3(RC),dim3(256),0,0,
+                                   c.state,(const uint16_t*)w.block_post,RC);
+            pf_stage_end(&tm, PF_S_MHC, 0);
+            if (pf_trace && pf_trace_pos >= base && pf_trace_pos < base + RC) {
+                const int trow = pf_trace_pos - base;
+                CK(hipDeviceSynchronize());
+                std::vector<uint16_t> t4((size_t)4 * HID);
+                CK(hipMemcpy(t4.data(), c.state + (size_t)trow*4*HID, (size_t)4*HID*2, hipMemcpyDeviceToHost));
+                double ss = 0, mx = 0; int nf = 0;
+                for (size_t i = 0; i < t4.size(); i++) {
+                    uint32_t u = (uint32_t)t4[i] << 16; float v; memcpy(&v, &u, 4);
+                    if (!std::isfinite(v)) nf++;
+                    ss += (double)v * v; mx = fmax(mx, fabs((double)v));
+                }
+                std::vector<float> hh(HID);
+                CK(hipMemcpy(hh.data(), c.hidden + (size_t)trow*HID, (size_t)HID*4, hipMemcpyDeviceToHost));
+                double hs2 = 0; for (float v : hh) hs2 += (double)v * v;
+                printf("    L%-2d dev%d %-5s %-3s  streams rms %10.4g max %10.4g nonfinite %d | mlp-out rms %10.4g\n",
+                       L, d, w.dense?"dense":"moe", w.dsa?"dsa":"swa",
+                       sqrt(ss/(double)t4.size()), mx, nf, sqrt(hs2/(double)HID));
+            }
+        }
+        if (pipe.sens_stage == 2)
+            for (int L = pipe.layer_begin[d]; L < pipe.layer_end[d]; L++) {
+                LayerW &w = LW[L];
+                const int win2 = w.dsa ? cfg.dsa_win : 512;
+                for (int r = 0; r < pipe.sens_reps; r++) {
+                    pf_attn_launch(cfg.attn_kernel,cfg.attn_tq,c.qabs,c.qrope,
+                                   (const uint16_t*)w.cache_kv,(const uint16_t*)w.cache_rope,
+                                   (const uint16_t*)w.sink_kv_n,(const uint16_t*)w.sink_rope,
+                                   base,rows_in_chunk,win2,c.ctx,0);
+                    sens_fired.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        CK(hipDeviceSynchronize());
+        pf_stage_accumulate(&tm);
+    };
+
+    // Runs the chunk pipeline over toks[0..n) at absolute positions pos0.., writing every layer's
+    // caches and MoME carries exactly as the decoder would have. Returns the wall in ms.
+    //
+    // THE HANDOFF IS A COPY OUT OF THE LANDING SLOT. The producer pushes chunk k into the consumer's
+    // landing slot (k & 1) and raises ready[d]; the consumer copies the slot into its own state
+    // buffer LOCALLY (the pushed bytes already sit in its HBM) and raises consumed[d], which is the
+    // producer's permission to reuse that slot two chunks later. The frozen bench pushed and then
+    // computed on a buffer nothing had written - cards 1-3 ran every chunk on uninitialised state.
+    auto run_prefill = [&](int pos0, const int *toks, int n) -> double {
+        if (n <= 0) return 0.0;
+        for (int d = 0; d < 4; d++) arena_layout_set(d, 1);
+        const int nchunks = (n + T - 1) / T;
+        std::atomic<int> ready[4], consumed[4];
+        for (int d = 0; d < 4; d++) { ready[d].store(-1); consumed[d].store(-1); }
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::thread> th;
+        for (int d = 0; d < 4; d++) th.emplace_back([&, d]{
+            CK(hipSetDevice(d));
+            for (int k = 0; k < nchunks; k++) {
+                const int base = k * T;
+                const int rows = (base + T <= n) ? T : (n - base);
+                const size_t bytes = (size_t)rows * 4 * HID * 2;
+                if (d == 0) {
+                    for (int r = 0; r < rows; r++) {
+                        const uint16_t *emb = ck.embed_ptr(toks[base + r]);
+                        for (int k2 = 0; k2 < 4; k2++) memcpy(&seedbuf[((size_t)r * 4 + k2) * HID], emb, (size_t)HID * 2);
+                    }
+                    CK(hipMemcpy(pf[0].state, seedbuf.data(), bytes, hipMemcpyHostToDevice));
+                } else {
+                    while (ready[d-1].load(std::memory_order_acquire) < k) std::this_thread::yield();
+                    CK(hipMemcpy(pf[d].state, (const char*)pipe.p2p.land[d] + (size_t)(k & 1) * land_bytes,
+                                 bytes, hipMemcpyDeviceToDevice));
+                    consumed[d].store(k, std::memory_order_release);
+                }
+                pf_layers(d, pos0 + base, rows);
+                if (d + 1 < 4) {
+                    while (consumed[d+1].load(std::memory_order_acquire) < k - 2) std::this_thread::yield();
+                    PfTimers &tm = pipe.timers[d];
+                    pf_stage_begin(&tm, PF_S_HANDOFF, 0);
+                    p92_p2p_push(&pipe.p2p, d, d + 1, pf[d].state, (size_t)(k & 1) * land_bytes, bytes, 0, (uint32_t)(k + 1));
+                    CK(hipSetDevice(d)); CK(hipStreamSynchronize(pipe.p2p.push[d]));
+                    pf_stage_end(&tm, PF_S_HANDOFF, 0);
+                    pf_stage_accumulate(&tm);
+                }
+                ready[d].store(k, std::memory_order_release);
+            }
+        });
+        for (auto &t : th) t.join();
+        for (int d = 0; d < 4; d++) { CK(hipSetDevice(d)); CK(hipDeviceSynchronize()); }
+        const double ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t0).count();
+        for (int d = 0; d < 4; d++) arena_layout_set(d, 0);   // the decoder's order again (outside the timed region)
+        if (cfg.verbose) {
+            PfResult res{}; res.prompt_tokens = n; res.chunk = T; res.prefill_ms = ms; res.prefill_toks = n / (ms / 1000.0);
+            pipe.nchunks = nchunks; pf_report(&pipe, &res);
+            for (int d = 0; d < 4; d++) for (int st = 0; st < PF_S_COUNT; st++) pipe.timers[d].ms[st] = 0.0;
+        }
+        return ms;
+    };
+    // ===================== end CHUNKED PREFILL ===================================
 
     // ---- one layer -------------------------------------------------------
     auto run_layer=[&](int L,int position)->void{
@@ -643,13 +1238,22 @@ int main(int argc,char**argv){
         if (!serve_tok) serve_tok = &stk;
     }
     std::deque<int> force;
-    for (size_t i = 1; i < prompt.size(); i++) force.push_back(prompt[i]);
-
     std::vector<int> out_tokens;
     int token = prompt.empty() ? START : prompt[0];
-    double first_ms=0, total_ms=0;
+    double first_ms=0, total_ms=0; int steps_timed = 0;
     int base_pos = 0;
-    int budget = NTOK;
+    double prefill_ms = 0.0; int prefill_n = 0;
+    if (use_prefill && (int)prompt.size() >= prefill_min) {
+        // all but the last prompt token go through the chunk pipeline; the decoder consumes the
+        // last one and produces the first generated token
+        prefill_n = (int)prompt.size() - 1;
+        prefill_ms = run_prefill(0, prompt.data(), prefill_n);
+        base_pos = prefill_n; token = prompt.back();
+        printf("[prefill] %d tokens in %.1f ms = %.1f tok/s (chunk %d)\n", prefill_n, prefill_ms,
+               1000.0 * prefill_n / prefill_ms, T);
+        fflush(stdout);
+    } else for (size_t i = 1; i < prompt.size(); i++) force.push_back(prompt[i]);
+    int budget = NTOK - base_pos;
     for(;;){
     for(int step=0; step<budget; step++){
         auto t0=std::chrono::steady_clock::now();
@@ -754,7 +1358,7 @@ int main(int argc,char**argv){
           } }
         auto t1=std::chrono::steady_clock::now();
         const double ms=std::chrono::duration<double,std::milli>(t1-t0).count();
-        if(step==0) first_ms=ms; else total_ms+=ms;
+        if(step==0) first_ms=ms; else { total_ms+=ms; steps_timed++; }
         if(text_mode && tokp && force.empty()){
             const std::string piece = tokp->decode_token(next);
             fputs(piece.c_str(), stdout); fflush(stdout);
@@ -777,16 +1381,25 @@ int main(int argc,char**argv){
         if(text_mode) fputs("\n", stdout);
         const std::string tq = p92::Tokenizer::chat_prompt(line);
         for(int32_t t : serve_tok->encode(tq)){ force.push_back((int)t); prompt.push_back((int)t); }
-        budget = (int)force.size() + maxnew;
-        out_tokens.clear(); first_ms=0; total_ms=0;
-        printf("[serve] request %d tokens, at position %d, budget %d\n",
-               (int)force.size(), base_pos, budget);
+        out_tokens.clear(); first_ms=0; total_ms=0; steps_timed=0;
+        printf("[serve] request %d tokens, at position %d\n", (int)force.size(), base_pos);
+        if (use_prefill && (int)force.size() >= prefill_min) {
+            // the previous answer's last token (not yet fed) + the request, all but its last token
+            std::vector<int> req; req.push_back(token); req.insert(req.end(), force.begin(), force.end()); force.clear();
+            const int m = (int)req.size() - 1;
+            const double pms = run_prefill(base_pos, req.data(), m);
+            printf("[serve] prefill %d tokens at position %d in %.1f ms = %.1f tok/s\n", m, base_pos, pms, 1000.0 * m / pms);
+            base_pos += m; token = req.back(); budget = maxnew;
+        } else budget = (int)force.size() + maxnew;
         fflush(stdout);
     }
     }   // for(;;) serve loop
     printf("\ntokens:"); for(int t:out_tokens) printf(" %d",t); printf("\n");
-    if(NTOK>1) printf("first token %.2f ms, steady %.2f ms/token = %.2f tok/s\n",
-                      first_ms,total_ms/(NTOK-1),1000.0*(NTOK-1)/total_ms);
+    if(steps_timed>0) printf("first token %.2f ms, steady %.2f ms/token = %.2f tok/s over %d steps\n",
+                      first_ms,total_ms/steps_timed,1000.0*steps_timed/total_ms,steps_timed);
+    if(prefill_n) printf("TTFT %.1f ms = prefill %d tokens %.1f ms + first decode step %.2f ms\n",
+                         prefill_ms+first_ms, prefill_n, prefill_ms, first_ms);
+    if (use_prefill) pf_pipeline_free(&pipe);
     p92_transport_free(&tx);
     return 0;
 }
