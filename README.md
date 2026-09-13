@@ -129,6 +129,13 @@ token, while attention itself is bounded. Prefill is the weaker component and
 A llama.cpp Q4_K_M build of the same model on the same machine measures 11.30 tok/s
 decode and 243-274 tok/s prefill.
 
+## Related
+
+A separate engine for a different model and hardware pairing, by the same author:
+[qwen3.8-27b-mi50-cpp-engine](https://github.com/bespokeontology/qwen3.8-27b-mi50-cpp-engine) -
+a native C++/HIP engine for Qwen3.8-27B on 4x AMD MI50 (gfx906), with chained MTP
+speculative decoding and no Python in the execution path.
+
 ## Licence
 
 Powered by openPangu. openPangu is a trademark of Huawei Technologies Co., Ltd.
